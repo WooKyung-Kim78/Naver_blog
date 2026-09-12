@@ -110,6 +110,15 @@ class FocusPoint:
 
 
 @dataclass
+class FocusChoice:
+    """집중 포인트 선택 결과. 마음에 드는 안이 없으면 retry 로 다시 받는다."""
+
+    point: FocusPoint | None = None
+    retry: bool = False
+    hint: str = ""  # 다시 받을 때 사용자가 알려준 방향
+
+
+@dataclass
 class ProductBrief:
     """AI 가 상품을 읽고 정리한 집필 설계도."""
 

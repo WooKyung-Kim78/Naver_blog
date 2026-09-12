@@ -34,6 +34,7 @@ from core.models import (
     KIND_LINK,
     Article,
     Draft,
+    FocusChoice,
     FocusPoint,
     ImageAsset,
     Product,
@@ -49,7 +50,10 @@ from render import naver_blocks
 from scrape import product as product_scraper
 
 Reporter = Callable[[str], None]
-Chooser = Callable[[list[FocusPoint]], FocusPoint]
+Chooser = Callable[[list[FocusPoint]], FocusChoice]
+
+#: 재제안을 무한정 돌면 토큰만 태운다. 이 횟수를 넘기면 포인트 없이 진행한다.
+MAX_FOCUS_ROUNDS = 4
 
 
 @dataclass
@@ -70,7 +74,7 @@ class Pipeline:
     def __init__(self, *, report: Reporter | None = None, choose: Chooser | None = None):
         self.report = report or (lambda _: None)
         # 콜백이 없으면 첫 번째 안을 자동 선택한다 (비대화형 실행용).
-        self.choose = choose or (lambda options: options[0])
+        self.choose = choose or (lambda options: FocusChoice(point=options[0]))
         self.ai_cfg = config.load_ai_config()
         self.img_cfg = config.load_image_config()
         self.gen_cfg = config.load_imagegen_config()
@@ -170,15 +174,32 @@ class Pipeline:
         else:
             self.report("상세 이미지가 없어 본문 텍스트만으로 집중 포인트를 뽑습니다")
 
-        try:
-            options = focus_mod.propose(self.client, product, brief, paths)
-        except Exception as exc:
-            self.report(f"  집중 포인트 제안 실패({exc}). 포인트 없이 진행합니다.")
-            return None, []
+        rejected: list[str] = []
+        hint = ""
+        for round_no in range(1, MAX_FOCUS_ROUNDS + 1):
+            if round_no > 1:
+                self.report(f"집중 포인트를 다시 뽑는 중 ({round_no}/{MAX_FOCUS_ROUNDS})")
+            try:
+                options = focus_mod.propose(
+                    self.client, product, brief, paths, avoid=rejected, hint=hint
+                )
+            except Exception as exc:
+                self.report(f"  집중 포인트 제안 실패({exc}). 포인트 없이 진행합니다.")
+                return None, []
 
-        chosen = self.choose(options)
-        self.report(f"  선택된 집중 포인트: {chosen.title}")
-        return chosen, options
+            choice = self.choose(options)
+            if not choice.retry:
+                if choice.point:
+                    self.report(f"  선택된 집중 포인트: {choice.point.title}")
+                else:
+                    self.report("  집중 포인트 없이 진행합니다.")
+                return choice.point, options
+
+            rejected += [o.title for o in options]
+            hint = choice.hint or hint
+
+        self.report("  재제안 횟수를 다 썼습니다. 집중 포인트 없이 진행합니다.")
+        return None, []
 
     def _write_until_good(
         self, product: Product, brief: ProductBrief, seo: SeoPlan, focus: FocusPoint | None

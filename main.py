@@ -18,7 +18,7 @@ from rich.table import Table
 
 import config
 from ai.client import AIError, MyGenAssistClient
-from core.models import KIND_CTA, KIND_HEADING, KIND_IMAGE, KIND_LINK, FocusPoint
+from core.models import KIND_CTA, KIND_HEADING, KIND_IMAGE, KIND_LINK, FocusChoice, FocusPoint
 from pipeline import Pipeline, PipelineResult
 
 console = Console()
@@ -128,7 +128,7 @@ def cmd_doctor() -> int:
 def cmd_post(args) -> int:
     pipeline = Pipeline(
         report=lambda msg: console.print(f"  {msg}" if msg.startswith(" ") else f"[cyan]›[/cyan] {msg}"),
-        choose=_choose_focus if not args.auto_focus else (lambda options: options[0]),
+        choose=(lambda options: FocusChoice(point=options[0])) if args.auto_focus else _choose_focus,
     )
 
     desc = args.desc
@@ -165,12 +165,12 @@ def cmd_post(args) -> int:
     return 0
 
 
-def _choose_focus(options: list[FocusPoint]) -> FocusPoint:
-    """상세페이지를 읽고 뽑은 집중 포인트 후보를 보여주고 하나를 고르게 한다."""
+def _choose_focus(options: list[FocusPoint]) -> FocusChoice:
+    """상세페이지에서 뽑은 상품의 포인트를 보여주고 하나를 고르게 한다."""
     console.print()
     console.print(Panel(
-        "상세페이지를 확인해 이 글에서 집중할 포인트를 정리했습니다.\n"
-        "하나를 고르면 글 전체가 그 각도로 쓰입니다.",
+        "상세페이지를 확인해 이 상품에서 집중할 만한 점을 정리했습니다.\n"
+        "하나를 고르면 글 전체가 그 점을 중심으로 쓰입니다.",
         title="집중 포인트 선택", border_style="cyan",
     ))
 
@@ -178,19 +178,31 @@ def _choose_focus(options: list[FocusPoint]) -> FocusPoint:
         body = [
             f"[white]{point.angle}[/white]",
             "",
-            f"[dim]근거[/dim]      {point.evidence}",
-            f"[dim]타깃[/dim]      {point.target}",
-            f"[dim]미는 이유[/dim] {point.why_now}",
+            f"[dim]상세페이지 근거[/dim] {point.evidence}",
+            f"[dim]도움 되는 사람[/dim]  {point.target}",
+            f"[dim]중요한 이유[/dim]    {point.why_now}",
         ]
         if point.keywords:
-            body.append(f"[dim]키워드[/dim]    {', '.join(point.keywords)}")
+            body.append(f"[dim]키워드[/dim]         {', '.join(point.keywords)}")
         if point.risk:
-            body.append(f"[yellow]약점[/yellow]      {point.risk}")
+            body.append(f"[yellow]놓치는 것[/yellow]      {point.risk}")
         console.print(Panel("\n".join(body), title=f"[bold]{i}. {point.title}[/bold]",
                             title_align="left", border_style="white"))
 
-    valid = tuple(str(i) for i in range(1, len(options) + 1))
-    return options[int(_ask(f"어느 포인트로 쓸까요? ({'/'.join(valid)})", valid)) - 1]
+    numbers = tuple(str(i) for i in range(1, len(options) + 1))
+    answer = _ask(
+        f"어느 점에 집중할까요? ({'/'.join(numbers)}"
+        " · r=다시 제안받기 · s=포인트 없이 진행)",
+        (*numbers, "r", "s"),
+    )
+
+    if answer == "s":
+        return FocusChoice()
+    if answer == "r":
+        console.print("[dim]원하는 방향이 있으면 알려주세요. 없으면 그냥 엔터.[/dim]")
+        console.print("[dim]예: 휴대성이나 무게 쪽으로, 초보자용 기능 위주로[/dim]")
+        return FocusChoice(retry=True, hint=input("> ").strip())
+    return FocusChoice(point=options[int(answer) - 1])
 
 
 def _show_report(result: PipelineResult) -> None:
