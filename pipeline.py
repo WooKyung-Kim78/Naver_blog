@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -54,6 +55,10 @@ Chooser = Callable[[list[FocusPoint]], FocusChoice]
 
 #: 재제안을 무한정 돌면 토큰만 태운다. 이 횟수를 넘기면 포인트 없이 진행한다.
 MAX_FOCUS_ROUNDS = 4
+
+#: 네이버 차단은 대개 잠깐이다. 몇 번 쉬었다 다시 해보고 나서 포기한다.
+SCRAPE_ROUNDS = 3
+SCRAPE_COOLDOWN = 45
 
 
 @dataclass
@@ -134,18 +139,13 @@ class Pipeline:
     def _collect_product(
         self, buy_url: str, page_url: str, manual_desc: str, collect_images: bool
     ) -> Product:
-        self.report(f"상품 페이지 수집 중: {page_url}")
-        product = product_scraper.fetch(
-            page_url, verify_ssl=self.ai_cfg.verify_ssl, proxies=self.ai_cfg.proxies
-        )
+        product, page_url = self._scrape_with_fallback(buy_url, page_url)
 
         # 긁는 주소와 본문에 넣을 구매 링크는 다를 수 있다. 링크는 제휴 추적이 붙은
         # 쪽을 써야 하므로 여기서 갈아 끼운다.
         product.page_url = page_url
         product.url = buy_url
 
-        if product.resolved_url and product.resolved_url != page_url:
-            self.report(f"  실제 주소: {product.resolved_url}")
         if buy_url != page_url:
             self.report(f"  본문 구매 링크: {buy_url}")
         self.report(f"  상품명: {product.title or '(못 찾음)'}")
@@ -167,6 +167,46 @@ class Pipeline:
         if not manual_desc:
             _require_product_signal(product)
         return product
+
+    def _scrape_with_fallback(self, buy_url: str, page_url: str) -> tuple[Product, str]:
+        """판매 페이지가 막히면 구매 링크로, 그래도 안 되면 좀 쉬었다 다시 시도한다.
+
+        네이버는 smartstore 직접 주소로 들어오는 자동 접근을 로그인 페이지로 돌려보낸다.
+        같은 상품이라도 제휴 링크로 들어가면 통과하는 경우가 많아서 그쪽으로 갈아탄다.
+        연달아 긁으면 아예 차단당하는데, 이때는 '상품이 없다'는 얼굴로 오기도 해서
+        기다렸다 다시 해보기 전에는 진짜 삭제와 구분할 수 없다.
+        """
+        urls = [page_url] + ([buy_url] if buy_url != page_url else [])
+        problem = ""
+
+        for attempt in range(1, SCRAPE_ROUNDS + 1):
+            if attempt > 1:
+                self.report(f"{SCRAPE_COOLDOWN}초 기다렸다 다시 시도합니다 ({attempt}/{SCRAPE_ROUNDS})")
+                time.sleep(SCRAPE_COOLDOWN)
+
+            for index, url in enumerate(urls):
+                self.report(f"상품 페이지 수집 중: {url}")
+                product = product_scraper.fetch(
+                    url, verify_ssl=self.ai_cfg.verify_ssl, proxies=self.ai_cfg.proxies
+                )
+                if product.resolved_url and product.resolved_url != url:
+                    self.report(f"  실제 주소: {product.resolved_url}")
+
+                problem = product_scraper.diagnose(product)
+                if not problem:
+                    return product, url
+
+                self.report(f"  [막힘] {problem}")
+                if index + 1 < len(urls):
+                    self.report("  구매 링크로 다시 시도합니다.")
+
+        raise product_scraper.ProductUnavailable(
+            f"상품 페이지를 읽지 못했습니다. {problem}.\n"
+            f"  시도한 주소: {', '.join(urls)}\n"
+            "  네이버가 짧은 시간에 반복 접속을 막습니다. 몇 분 뒤에 다시 실행해 보세요.\n"
+            "  판매 페이지를 브라우저로 직접 열어 정상인지도 확인해 보세요.\n"
+            "  계속 막히면 --desc 로 상품 설명을 직접 넣어 진행할 수 있습니다."
+        )
 
     def _prepare_images(self, product: Product, run_dir: Path) -> list[ImageAsset]:
         """상품 이미지를 미리 내려받아 평가·중복제거까지 마친다.
@@ -399,9 +439,12 @@ def _require_product_signal(product: Product) -> None:
         "상품 정보를 충분히 읽지 못했습니다. 이대로 진행하면 페이지의 메뉴와 안내문만 보고 "
         "실제와 다른 글을 지어냅니다.\n"
         f"  들어간 주소: {where}\n"
+        f"  상품명: {product.title or '(못 찾음)'}\n"
         f"  확보한 것: {found}\n"
         f"  못 찾은 것: {missing}\n"
-        "  판매 페이지가 정상인지 확인하거나, --desc 로 상품 설명을 직접 넣어 주세요."
+        "  상품명은 읽혔는데 나머지가 비었다면 네이버가 접속을 제한하는 중일 가능성이 큽니다. "
+        "몇 분 뒤에 다시 실행해 보세요.\n"
+        "  계속 막히면 --desc 로 상품 설명을 직접 넣어 진행할 수 있습니다."
     )
 
 

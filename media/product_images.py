@@ -153,10 +153,25 @@ def _open_detail_tab(page) -> None:
 
 
 def _scroll_to_bottom(page, steps: int = 14) -> None:
+    """끝까지 훑되, 페이지가 오류 화면으로 바뀌면 즉시 멈춘다.
+
+    네이버가 접속을 제한하는 동안에는 스크롤이 유발한 지연 로딩 요청이 실패하면서
+    페이지 전체가 '상품이 존재하지 않습니다' 로 갈아치워진다. 계속 스크롤하면
+    그때까지 잡아둔 이미지까지 날아간다.
+    """
     for _ in range(steps):
         page.mouse.wheel(0, 2200)
         page.wait_for_timeout(700)
+        if _page_died(page):
+            return
     page.wait_for_timeout(1500)
+
+
+def _page_died(page) -> bool:
+    try:
+        return any(m in page.title() for m in ("상품이 존재하지 않습니다", "에러", "오류"))
+    except Exception:
+        return False
 
 
 def _is_usable(src: str, item: dict) -> bool:

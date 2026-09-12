@@ -50,6 +50,14 @@ DEAD_PAGE_MARKERS = (
     "page not found",
 )
 
+#: 네이버는 자동화된 접근을 로그인 페이지로 돌려보낸다. 특히 smartstore.naver.com
+#: 직접 주소에서 자주 걸린다. 같은 상품도 제휴 링크로 들어가면 통과하는 경우가 많다.
+LOGIN_WALL_MARKERS = ("nid.naver.com/nidlogin", "nidlogin.login", "/login?")
+
+#: 짧은 시간에 여러 번 긁으면 네이버가 막는다. 이때 '상품이 없다'는 얼굴로 오기도 해서
+#: 진짜 삭제와 구분이 안 된다. 잠시 기다렸다 다시 해보면 대개 풀린다.
+THROTTLE_MARKERS = ("에러페이지", "시스템 오류", "일시적인 오류", "잠시 후 다시", "too many requests")
+
 #: og:title 이 사이트 이름으로 채워져 있는 경우가 있어, 상품명으로 쓰면 안 된다.
 GENERIC_TITLES = (
     "네이버 브랜드 커넥트", "네이버플러스 스토어", "네이버쇼핑", "네이버 쇼핑",
@@ -62,6 +70,7 @@ class ProductUnavailable(RuntimeError):
 
 
 def fetch(url: str, *, verify_ssl: bool = True, proxies: dict | None = None) -> Product:
+    """페이지를 긁어온다. 문제가 있어도 여기서 막지 않고 diagnose 로 판단한다."""
     html = _fetch_static(url, verify_ssl=verify_ssl, proxies=proxies)
     product = _parse(url, html) if html else Product(url=url)
 
@@ -71,26 +80,28 @@ def fetch(url: str, *, verify_ssl: bool = True, proxies: dict | None = None) -> 
             product = _merge(product, _parse(url, rendered))
         product.resolved_url = final_url
 
-    _reject_dead_page(product)
     return product
 
 
-def _reject_dead_page(product: Product) -> None:
-    """'상품이 존재하지 않습니다' 류의 안내가 떠 있으면 거기서 멈춘다.
+def diagnose(product: Product) -> str:
+    """상품 페이지로 쓸 수 없는 상태면 이유를 문장으로 돌려준다. 멀쩡하면 빈 문자열.
 
     안내문은 페이지 맨 앞에 뜨므로 본문 앞부분만 본다. 뒤쪽 후기까지 뒤지면
     "찾을 수 없었는데" 같은 평범한 문장에 걸려 멀쩡한 상품을 막게 된다.
     """
+    landed = (product.resolved_url or "").lower()
+    if any(m in landed for m in LOGIN_WALL_MARKERS):
+        return "네이버가 로그인 페이지로 돌려보냈습니다 (자동 접근 차단)"
+
     haystack = f"{product.title}\n{product.body_text[:800]}".lower()
+    for marker in THROTTLE_MARKERS:
+        if marker in haystack:
+            return "네이버가 요청을 막고 있습니다 (짧은 시간에 너무 여러 번 접속)"
     for marker in DEAD_PAGE_MARKERS:
         if marker in haystack:
-            where = product.resolved_url or product.page_url or product.url
-            raise ProductUnavailable(
-                f"상품 페이지가 열리지 않습니다. 페이지에 '{marker}' 안내가 떠 있습니다.\n"
-                f"  들어간 주소: {where}\n"
-                "  링크가 만료되었거나 상품이 내려간 것 같습니다. 판매 페이지를 직접 열어 "
-                "확인한 뒤 유효한 링크로 다시 실행하세요."
-            )
+            return f"페이지에 '{marker}' 안내가 떠 있습니다"
+
+    return ""
 
 
 def _fetch_static(url: str, *, verify_ssl: bool, proxies: dict | None) -> str:
@@ -137,14 +148,30 @@ def _fetch_rendered(url: str) -> tuple[str, str]:
             page = context.new_page()
             page.goto(url, wait_until="domcontentloaded", timeout=45_000)
             page.wait_for_timeout(3000)
+
+            # 스크롤은 지연 로딩된 본문을 더 끌어오지만, 차단 상태에서는 그 요청이
+            # 실패하면서 페이지가 '상품이 존재하지 않습니다' 로 갈아치워진다.
+            # 그래서 스크롤 전 상태를 들고 있다가, 망가지면 그걸 쓴다.
+            html, final_url = page.content(), page.url
             for _ in range(4):
                 page.mouse.wheel(0, 2500)
                 page.wait_for_timeout(1200)
-            html, final_url = page.content(), page.url
+                grown = page.content()
+                if _looks_dead(grown):
+                    break
+                html, final_url = grown, page.url
+
             browser.close()
             return html, final_url
     except Exception:
         return "", ""
+
+
+def _looks_dead(html: str) -> bool:
+    """페이지가 오류 화면으로 갈아치워졌는지 제목과 앞부분만 보고 빠르게 판단한다."""
+    title = re.search(r"<title[^>]*>(.*?)</title>", html, re.S | re.I)
+    haystack = f"{title.group(1) if title else ''}\n{html[:4000]}".lower()
+    return any(m in haystack for m in DEAD_PAGE_MARKERS + THROTTLE_MARKERS)
 
 
 def _parse(url: str, html: str) -> Product:
