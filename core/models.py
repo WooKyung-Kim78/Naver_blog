@@ -17,9 +17,12 @@ from typing import Any
 class Product:
     """상품 페이지에서 긁어온 원재료."""
 
+    #: 블로그 본문에 넣을 구매 링크. 제휴 추적이 붙어 있으므로 절대 다른 주소로
+    #: 바꾸지 않는다. 수익이 여기에 달려 있다.
     url: str
-    #: 단축/제휴 링크가 최종적으로 도착한 주소. 진단용이며, 본문 구매 링크에는
-    #: 제휴 추적이 붙은 원래 url 을 그대로 쓴다.
+    #: 실제로 크롤링한 상품 페이지. 비어 있으면 url 과 같다.
+    page_url: str = ""
+    #: page_url 이 리다이렉트를 거쳐 최종 도착한 주소. 진단용이다.
     resolved_url: str = ""
     title: str = ""
     description: str = ""
@@ -36,7 +39,7 @@ class Product:
         return self.thumbnail_urls + self.detail_image_urls
 
     def as_prompt_context(self, limit: int = 6000) -> str:
-        parts = [f"[상품 페이지 URL] {self.url}"]
+        parts = [f"[상품 페이지 URL] {self.page_url or self.url}"]
         for label, value in (
             ("상품명", self.title),
             ("브랜드", self.brand),

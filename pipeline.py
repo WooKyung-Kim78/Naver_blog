@@ -85,8 +85,20 @@ class Pipeline:
 
     # ------------------------------------------------------------------ 실행
 
-    def run(self, url: str, *, manual_desc: str = "", collect_images: bool = True) -> PipelineResult:
-        product = self._collect_product(url, manual_desc, collect_images)
+    def run(
+        self,
+        url: str,
+        *,
+        page_url: str = "",
+        manual_desc: str = "",
+        collect_images: bool = True,
+    ) -> PipelineResult:
+        """url 은 본문에 넣을 구매 링크, page_url 은 내용을 긁어올 실제 상품 페이지다.
+
+        브랜드 커넥트 제휴 링크는 중간 페이지를 거치느라 상품 내용이 안 잡히는 경우가
+        있어서 둘을 나눠 받는다. page_url 을 비우면 구매 링크를 그대로 긁는다.
+        """
+        product = self._collect_product(url, page_url or url, manual_desc, collect_images)
 
         # 이미지를 먼저 내려받아야 해서 제목이 정해지기 전에 폴더를 만든다.
         # 완성된 제목은 나중에 알게 되므로 그때 폴더 이름을 고쳐 단다.
@@ -119,12 +131,23 @@ class Pipeline:
 
     # -------------------------------------------------------------- 각 단계
 
-    def _collect_product(self, url: str, manual_desc: str, collect_images: bool) -> Product:
-        self.report(f"상품 페이지 수집 중: {url}")
-        product = product_scraper.fetch(url, verify_ssl=self.ai_cfg.verify_ssl, proxies=self.ai_cfg.proxies)
+    def _collect_product(
+        self, buy_url: str, page_url: str, manual_desc: str, collect_images: bool
+    ) -> Product:
+        self.report(f"상품 페이지 수집 중: {page_url}")
+        product = product_scraper.fetch(
+            page_url, verify_ssl=self.ai_cfg.verify_ssl, proxies=self.ai_cfg.proxies
+        )
 
-        if product.resolved_url and product.resolved_url != url:
+        # 긁는 주소와 본문에 넣을 구매 링크는 다를 수 있다. 링크는 제휴 추적이 붙은
+        # 쪽을 써야 하므로 여기서 갈아 끼운다.
+        product.page_url = page_url
+        product.url = buy_url
+
+        if product.resolved_url and product.resolved_url != page_url:
             self.report(f"  실제 주소: {product.resolved_url}")
+        if buy_url != page_url:
+            self.report(f"  본문 구매 링크: {buy_url}")
         self.report(f"  상품명: {product.title or '(못 찾음)'}")
 
         if manual_desc:
@@ -134,7 +157,7 @@ class Pipeline:
             self.report("상세페이지 이미지 탐색 중 (스크롤하며 지연 로딩 유도)")
             from media import product_images
 
-            thumbs, details = product_images.collect(url)
+            thumbs, details = product_images.collect(page_url)
             seen = set(product.thumbnail_urls)
             product.thumbnail_urls += [a.url for a in thumbs if a.url not in seen]
             product.detail_image_urls = [a.url for a in details]
@@ -156,7 +179,10 @@ class Pipeline:
             return []
 
         self.report(f"상품 이미지 {len(candidates)}개 내려받아 평가 중")
-        available = self._processor.prepare(candidates, run_dir / "images" / "product", referer=product.url)
+        # 네이버 이미지 CDN 은 Referer 를 본다. 구매 링크가 아니라 이미지를 찾은
+        # 페이지 주소를 보내야 한다.
+        referer = product.resolved_url or product.page_url or product.url
+        available = self._processor.prepare(candidates, run_dir / "images" / "product", referer=referer)
 
         by_source: dict[str, int] = {}
         for asset in available:
@@ -320,7 +346,13 @@ class Pipeline:
         (run_dir / "report.json").write_text(
             json.dumps(
                 {
-                    "product": {"url": product.url, "title": product.title, "price": product.price},
+                    "product": {
+                        "buy_url": product.url,
+                        "page_url": product.page_url,
+                        "resolved_url": product.resolved_url,
+                        "title": product.title,
+                        "price": product.price,
+                    },
                     "brief": {
                         "category": brief.category,
                         "features": [f.__dict__ for f in brief.features],
@@ -362,7 +394,7 @@ def _require_product_signal(product: Product) -> None:
 
     found = ", ".join(k for k, v in signals.items() if v) or "없음"
     missing = ", ".join(k for k, v in signals.items() if not v)
-    where = product.resolved_url or product.url
+    where = product.resolved_url or product.page_url or product.url
     raise product_scraper.ProductUnavailable(
         "상품 정보를 충분히 읽지 못했습니다. 이대로 진행하면 페이지의 메뉴와 안내문만 보고 "
         "실제와 다른 글을 지어냅니다.\n"

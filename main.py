@@ -32,7 +32,9 @@ def main() -> int:
     sub.add_parser("doctor", help="설정과 API 연결 점검")
 
     post = sub.add_parser("post", help="상품 URL 로 리뷰 생성")
-    post.add_argument("--url", required=True, help="홍보할 상품 페이지 URL")
+    post.add_argument("--url", required=True, help="본문에 넣을 구매 링크 (브랜드 커넥트 제휴 링크)")
+    post.add_argument("--page-url", default="",
+                      help="내용을 긁어올 실제 상품 페이지. 생략하면 물어본다")
     post.add_argument("--desc", default="", help="상품 설명 직접 입력(사이트가 크롤링을 막을 때)")
     post.add_argument("--dry-run", action="store_true", help="네이버에 올리지 않고 원고만 생성")
     post.add_argument("--no-images", action="store_true", help="상세페이지 이미지 수집 건너뛰기(빠름)")
@@ -137,8 +139,10 @@ def cmd_post(args) -> int:
         choose=(lambda options: FocusChoice(point=options[0])) if args.auto_focus else _choose_focus,
     )
 
-    desc = args.desc
-    result = pipeline.run(args.url, manual_desc=desc, collect_images=not args.no_images)
+    page_url = args.page_url or _ask_page_url(args.url)
+    result = pipeline.run(
+        args.url, page_url=page_url, manual_desc=args.desc, collect_images=not args.no_images
+    )
 
     _show_report(result)
     console.print(f"\n결과 저장 위치: [white]{result.run_dir}[/white]")
@@ -169,6 +173,34 @@ def cmd_post(args) -> int:
 
     console.print(f"\n[bold green]{message}[/bold green]")
     return 0
+
+
+def _ask_page_url(buy_url: str) -> str:
+    """내용을 긁어올 실제 상품 페이지를 물어본다.
+
+    브랜드 커넥트 제휴 링크는 중간 페이지를 거쳐서 상품 내용이 제대로 안 잡히는
+    경우가 있다. 판매 페이지 주소를 직접 받으면 그 문제가 사라진다.
+    """
+    console.print()
+    console.print(Panel(
+        f"[dim]구매 링크[/dim]  {buy_url}\n"
+        "이 링크는 블로그 본문의 구매 링크로 그대로 들어갑니다. (제휴 추적 유지)\n\n"
+        "내용과 이미지를 긁어올 [bold]실제 상품 판매 페이지[/bold] 주소를 알려주세요.\n"
+        "[dim]예: https://brand.naver.com/finevu/products/13030260544[/dim]\n"
+        "[dim]모르면 그냥 엔터. 구매 링크를 따라가서 긁습니다.[/dim]",
+        title="실제 상품 페이지", title_align="left", border_style="cyan",
+    ))
+
+    while True:
+        try:
+            answer = input("> ").strip()
+        except EOFError:  # 파이프로 실행한 경우
+            return buy_url
+        if not answer:
+            return buy_url
+        if answer.startswith(("http://", "https://")):
+            return answer
+        console.print("[yellow]http 로 시작하는 주소를 넣어주세요. 그냥 쓰려면 엔터.[/yellow]")
 
 
 def _choose_focus(options: list[FocusPoint]) -> FocusChoice:

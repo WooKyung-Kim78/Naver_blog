@@ -84,7 +84,7 @@ def _reject_dead_page(product: Product) -> None:
     haystack = f"{product.title}\n{product.body_text[:800]}".lower()
     for marker in DEAD_PAGE_MARKERS:
         if marker in haystack:
-            where = product.resolved_url or product.url
+            where = product.resolved_url or product.page_url or product.url
             raise ProductUnavailable(
                 f"상품 페이지가 열리지 않습니다. 페이지에 '{marker}' 안내가 떠 있습니다.\n"
                 f"  들어간 주소: {where}\n"

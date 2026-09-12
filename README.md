@@ -133,12 +133,28 @@ python main.py doctor
 
 ## 사용
 
+`--url` 은 **본문에 넣을 구매 링크**다. 브랜드 커넥트 제휴 링크를 그대로 넣으면 된다.
+내용과 이미지를 긁어올 **실제 판매 페이지**는 따로 물어본다. 제휴 링크는 중간 페이지를
+거치느라 상품 내용이 덜 잡히는 경우가 있어서 둘을 나눠 받는다. 모르면 엔터를 치면
+구매 링크를 따라가서 긁는다. `--page-url` 로 미리 넘기면 묻지 않는다.
+
+```
+구매 링크  https://naver.me/Gy3xcwOD
+이 링크는 블로그 본문의 구매 링크로 그대로 들어갑니다. (제휴 추적 유지)
+
+내용과 이미지를 긁어올 실제 상품 판매 페이지 주소를 알려주세요.
+> https://brand.naver.com/finevu/products/13030260544
+```
+
 ```powershell
 # 원고와 이미지만 생성. HTML 미리보기까지 열기
-python main.py post --url "https://상품페이지주소" --dry-run --open
+python main.py post --url "https://구매링크" --dry-run --open
+
+# 판매 페이지를 미리 넘겨 묻지 않게 하기
+python main.py post --url "https://구매링크" --page-url "https://판매페이지"
 
 # 실제 포스팅
-python main.py post --url "https://상품페이지주소"
+python main.py post --url "https://구매링크"
 
 # 크롤링이 막히는 사이트는 설명을 직접 넘긴다
 python main.py post --url "https://..." --desc "상품 설명"
@@ -173,7 +189,8 @@ python main.py post --url "https://..." --auto-focus
    못 찾은 항목을 알려주고 멈춘다.
 
 단축 링크가 실제로 도착한 주소도 함께 보여준다. 제휴 링크는 어디로 가는지 눈에 보이지
-않아서, 만료된 링크를 붙여놓고도 모르는 경우가 많다.
+않아서, 만료된 링크를 붙여놓고도 모르는 경우가 많다. 여기서 만료를 확인했다면 판매
+페이지를 찾아 `--page-url` 로 넘기면 된다. 본문 구매 링크는 원래 제휴 링크가 유지된다.
 
 `--desc` 로 상품 설명을 직접 넣으면 이 검사를 건너뛴다.
 
