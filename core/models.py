@@ -18,6 +18,9 @@ class Product:
     """상품 페이지에서 긁어온 원재료."""
 
     url: str
+    #: 단축/제휴 링크가 최종적으로 도착한 주소. 진단용이며, 본문 구매 링크에는
+    #: 제휴 추적이 붙은 원래 url 을 그대로 쓴다.
+    resolved_url: str = ""
     title: str = ""
     description: str = ""
     price: str = ""

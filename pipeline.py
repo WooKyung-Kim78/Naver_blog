@@ -123,6 +123,10 @@ class Pipeline:
         self.report(f"상품 페이지 수집 중: {url}")
         product = product_scraper.fetch(url, verify_ssl=self.ai_cfg.verify_ssl, proxies=self.ai_cfg.proxies)
 
+        if product.resolved_url and product.resolved_url != url:
+            self.report(f"  실제 주소: {product.resolved_url}")
+        self.report(f"  상품명: {product.title or '(못 찾음)'}")
+
         if manual_desc:
             product.body_text = f"{manual_desc}\n\n{product.body_text}"
 
@@ -137,6 +141,8 @@ class Pipeline:
             self.report(f"  썸네일 {len(product.thumbnail_urls)}개 / 상세 이미지 {len(product.detail_image_urls)}개")
 
         self.report(f"  본문 {len(product.body_text):,}자 / 스펙 {len(product.specs)}항목")
+        if not manual_desc:
+            _require_product_signal(product)
         return product
 
     def _prepare_images(self, product: Product, run_dir: Path) -> list[ImageAsset]:
@@ -337,6 +343,34 @@ class Pipeline:
             ),
             encoding="utf-8",
         )
+
+
+#: 상품 페이지라면 이 중 최소 몇 개는 잡혀야 한다. 죄다 비어 있는데도 진행하면
+#: 메뉴와 푸터만 읽고 있지도 않은 상품의 글을 지어내게 된다.
+MIN_PRODUCT_SIGNALS = 2
+
+
+def _require_product_signal(product: Product) -> None:
+    signals = {
+        "가격": bool(product.price),
+        "스펙표": len(product.specs) >= 3,
+        "상세 이미지": len(product.detail_image_urls) >= 3,
+        "본문": len(product.body_text) >= 1200,
+    }
+    if sum(signals.values()) >= MIN_PRODUCT_SIGNALS:
+        return
+
+    found = ", ".join(k for k, v in signals.items() if v) or "없음"
+    missing = ", ".join(k for k, v in signals.items() if not v)
+    where = product.resolved_url or product.url
+    raise product_scraper.ProductUnavailable(
+        "상품 정보를 충분히 읽지 못했습니다. 이대로 진행하면 페이지의 메뉴와 안내문만 보고 "
+        "실제와 다른 글을 지어냅니다.\n"
+        f"  들어간 주소: {where}\n"
+        f"  확보한 것: {found}\n"
+        f"  못 찾은 것: {missing}\n"
+        "  판매 페이지가 정상인지 확인하거나, --desc 로 상품 설명을 직접 넣어 주세요."
+    )
 
 
 def _rename_run_dir(

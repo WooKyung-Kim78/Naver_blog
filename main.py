@@ -20,6 +20,7 @@ import config
 from ai.client import AIError, MyGenAssistClient
 from core.models import KIND_CTA, KIND_HEADING, KIND_IMAGE, KIND_LINK, FocusChoice, FocusPoint
 from pipeline import Pipeline, PipelineResult
+from scrape.product import ProductUnavailable
 
 console = Console()
 
@@ -48,6 +49,11 @@ def main() -> int:
         return 130
     except config.ConfigError as exc:
         console.print(f"\n[red]설정 오류:[/red] {exc}")
+        return 1
+    except ProductUnavailable as exc:
+        console.print()
+        console.print(Panel(str(exc), title="상품 정보를 가져오지 못했습니다",
+                            title_align="left", border_style="red"))
         return 1
     except (AIError, RuntimeError) as exc:
         console.print(f"\n[red]오류:[/red] {explain(exc)}")

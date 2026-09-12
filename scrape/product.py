@@ -34,6 +34,22 @@ SELLER_INFO_KEYS = (
     "e-mail", "주소", "반품", "교환", "배송", "결제", "환불", "as 안내", "a/s 안내",
 )
 
+#: 상품이 내려갔거나 링크가 만료된 페이지. 이걸 그냥 넘기면 메뉴와 푸터만 보고
+#: 있지도 않은 상품의 글을 지어내게 된다.
+DEAD_PAGE_MARKERS = (
+    "상품이 존재하지 않습니다",
+    "존재하지 않는 상품",
+    "상품을 찾을 수 없",
+    "삭제되었거나",
+    "판매가 중지",
+    "판매중지된 상품",
+    "페이지를 찾을 수 없",
+    "요청하신 페이지를 찾을 수 없",
+    "잘못된 접근",
+    "access denied",
+    "page not found",
+)
+
 #: og:title 이 사이트 이름으로 채워져 있는 경우가 있어, 상품명으로 쓰면 안 된다.
 GENERIC_TITLES = (
     "네이버 브랜드 커넥트", "네이버플러스 스토어", "네이버쇼핑", "네이버 쇼핑",
@@ -41,16 +57,40 @@ GENERIC_TITLES = (
 )
 
 
+class ProductUnavailable(RuntimeError):
+    """상품 페이지가 죽었거나 상품 정보를 얻지 못했을 때."""
+
+
 def fetch(url: str, *, verify_ssl: bool = True, proxies: dict | None = None) -> Product:
     html = _fetch_static(url, verify_ssl=verify_ssl, proxies=proxies)
     product = _parse(url, html) if html else Product(url=url)
 
     if len(product.body_text) < MIN_TEXT_LENGTH:
-        rendered = _fetch_rendered(url)
+        rendered, final_url = _fetch_rendered(url)
         if rendered:
             product = _merge(product, _parse(url, rendered))
+        product.resolved_url = final_url
 
+    _reject_dead_page(product)
     return product
+
+
+def _reject_dead_page(product: Product) -> None:
+    """'상품이 존재하지 않습니다' 류의 안내가 떠 있으면 거기서 멈춘다.
+
+    안내문은 페이지 맨 앞에 뜨므로 본문 앞부분만 본다. 뒤쪽 후기까지 뒤지면
+    "찾을 수 없었는데" 같은 평범한 문장에 걸려 멀쩡한 상품을 막게 된다.
+    """
+    haystack = f"{product.title}\n{product.body_text[:800]}".lower()
+    for marker in DEAD_PAGE_MARKERS:
+        if marker in haystack:
+            where = product.resolved_url or product.url
+            raise ProductUnavailable(
+                f"상품 페이지가 열리지 않습니다. 페이지에 '{marker}' 안내가 떠 있습니다.\n"
+                f"  들어간 주소: {where}\n"
+                "  링크가 만료되었거나 상품이 내려간 것 같습니다. 판매 페이지를 직접 열어 "
+                "확인한 뒤 유효한 링크로 다시 실행하세요."
+            )
 
 
 def _fetch_static(url: str, *, verify_ssl: bool, proxies: dict | None) -> str:
@@ -69,11 +109,12 @@ def _fetch_static(url: str, *, verify_ssl: bool, proxies: dict | None) -> str:
         return ""
 
 
-def _fetch_rendered(url: str) -> str:
+def _fetch_rendered(url: str) -> tuple[str, str]:
+    """렌더링한 HTML 과, 리다이렉트를 다 따라간 최종 주소를 함께 돌려준다."""
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
-        return ""
+        return "", ""
 
     try:
         with sync_playwright() as p:
@@ -99,11 +140,11 @@ def _fetch_rendered(url: str) -> str:
             for _ in range(4):
                 page.mouse.wheel(0, 2500)
                 page.wait_for_timeout(1200)
-            html = page.content()
+            html, final_url = page.content(), page.url
             browser.close()
-            return html
+            return html, final_url
     except Exception:
-        return ""
+        return "", ""
 
 
 def _parse(url: str, html: str) -> Product:
