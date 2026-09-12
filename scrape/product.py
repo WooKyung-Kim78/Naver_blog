@@ -1,18 +1,20 @@
-"""상품 페이지에서 홍보 글 작성에 필요한 정보를 뽑아낸다.
+"""상품 페이지에서 텍스트 정보와 이미지 URL 을 뽑아낸다.
 
 먼저 requests 로 시도하고, 자바스크립트로 렌더링되는 쇼핑몰(스마트스토어, 쿠팡 등)이라
-본문이 거의 없으면 Playwright 로 다시 가져온다.
+본문이 거의 없으면 Playwright 로 다시 가져온다. 이미지는 media/product_images.py 가
+브라우저를 띄워 따로 수집한다.
 """
 
 from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass, field
 from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
+
+from core.models import Product
 
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -20,33 +22,6 @@ UA = (
 )
 
 MIN_TEXT_LENGTH = 400
-
-
-@dataclass
-class Product:
-    url: str
-    title: str = ""
-    description: str = ""
-    price: str = ""
-    brand: str = ""
-    site_name: str = ""
-    image_urls: list[str] = field(default_factory=list)
-    body_text: str = ""
-
-    def as_prompt_context(self, limit: int = 6000) -> str:
-        parts = [f"[상품 페이지 URL] {self.url}"]
-        for label, value in (
-            ("상품명", self.title),
-            ("브랜드", self.brand),
-            ("판매처", self.site_name),
-            ("가격", self.price),
-            ("요약", self.description),
-        ):
-            if value:
-                parts.append(f"[{label}] {value}")
-        if self.body_text:
-            parts.append(f"[페이지 본문]\n{self.body_text[:limit]}")
-        return "\n".join(parts)
 
 
 def fetch(url: str, *, verify_ssl: bool = True, proxies: dict | None = None) -> Product:
@@ -132,9 +107,10 @@ def _parse(url: str, html: str) -> Product:
 
     for tag in soup.find_all("meta", attrs={"property": "og:image"}):
         if tag.get("content"):
-            product.image_urls.append(urljoin(url, tag["content"]))
+            product.thumbnail_urls.append(urljoin(url, tag["content"]))
 
     _apply_json_ld(soup, product, url)
+    product.specs = _extract_specs(soup)
 
     for junk in soup(["script", "style", "noscript", "header", "footer", "nav", "iframe", "svg"]):
         junk.decompose()
@@ -142,6 +118,29 @@ def _parse(url: str, html: str) -> Product:
     product.body_text = re.sub(r"[ \t]{2,}", " ", text)
 
     return product
+
+
+def _extract_specs(soup: BeautifulSoup) -> dict[str, str]:
+    """상품 고시정보나 사양표는 보통 th/td 또는 dt/dd 쌍으로 되어 있다."""
+    specs: dict[str, str] = {}
+
+    for row in soup.find_all("tr"):
+        key = row.find("th")
+        value = row.find("td")
+        if key and value:
+            k, v = key.get_text(" ", strip=True), value.get_text(" ", strip=True)
+            if k and v and len(k) < 40 and len(v) < 200:
+                specs.setdefault(k, v)
+
+    for dl in soup.find_all("dl"):
+        terms = dl.find_all("dt")
+        definitions = dl.find_all("dd")
+        for term, definition in zip(terms, definitions):
+            k, v = term.get_text(" ", strip=True), definition.get_text(" ", strip=True)
+            if k and v and len(k) < 40 and len(v) < 200:
+                specs.setdefault(k, v)
+
+    return dict(list(specs.items())[:40])
 
 
 def _apply_json_ld(soup: BeautifulSoup, product: Product, url: str) -> None:
@@ -174,7 +173,7 @@ def _apply_json_ld(soup: BeautifulSoup, product: Product, url: str) -> None:
             images = node.get("image")
             for img in [images] if isinstance(images, str) else (images or []):
                 if isinstance(img, str):
-                    product.image_urls.append(urljoin(url, img))
+                    product.thumbnail_urls.append(urljoin(url, img))
 
 
 def _merge(base: Product, extra: Product) -> Product:
@@ -183,6 +182,9 @@ def _merge(base: Product, extra: Product) -> Product:
             setattr(base, attr, getattr(extra, attr))
     if len(extra.body_text) > len(base.body_text):
         base.body_text = extra.body_text
-    seen = set(base.image_urls)
-    base.image_urls.extend(u for u in extra.image_urls if u not in seen and not seen.add(u))
+    if not base.specs:
+        base.specs = extra.specs
+
+    seen = set(base.thumbnail_urls)
+    base.thumbnail_urls.extend(u for u in extra.thumbnail_urls if u not in seen and not seen.add(u))
     return base

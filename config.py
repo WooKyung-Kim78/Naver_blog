@@ -97,6 +97,31 @@ class ImageConfig:
 
 
 @dataclass
+class ImageGenConfig:
+    """AI 이미지 생성. Bayer API 에는 생성 기능이 없어 외부 프로바이더를 꽂는다."""
+
+    base_url: str
+    api_key: str
+    auth_header: str
+    auth_prefix: str
+    model: str
+    size: str
+    verify_ssl: bool
+    proxies: dict[str, str] = field(default_factory=dict)
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.base_url and self.api_key)
+
+
+@dataclass
+class QualityConfig:
+    pass_mark: int
+    max_attempts: int
+    humanize: bool
+
+
+@dataclass
 class NaverConfig:
     user_id: str
     password: str
@@ -158,6 +183,27 @@ def load_image_config() -> ImageConfig:
         count=_get_int("IMAGE_COUNT", 4),
         verify_ssl=_get_bool("AI_VERIFY_SSL", True),
         proxies=_proxies(),
+    )
+
+
+def load_imagegen_config() -> ImageGenConfig:
+    return ImageGenConfig(
+        base_url=_get("IMAGE_GEN_BASE_URL"),
+        api_key=_get("IMAGE_GEN_API_KEY"),
+        auth_header=_get("IMAGE_GEN_AUTH_HEADER", "Authorization"),
+        auth_prefix=_get("IMAGE_GEN_AUTH_PREFIX", "Bearer"),
+        model=_get("IMAGE_GEN_MODEL", "gpt-image-1"),
+        size=_get("IMAGE_GEN_SIZE", "1024x1024"),
+        verify_ssl=_get_bool("AI_VERIFY_SSL", True),
+        proxies=_proxies(),
+    )
+
+
+def load_quality_config() -> QualityConfig:
+    return QualityConfig(
+        pass_mark=_get_int("QUALITY_PASS_MARK", 80),
+        max_attempts=_get_int("QUALITY_MAX_ATTEMPTS", 3),
+        humanize=_get_bool("HUMANIZE", True),
     )
 
 

@@ -44,6 +44,16 @@ IMAGE_BUTTON_SELECTORS = [
     "button[data-name='image']",
     ".se-toolbar-item-image button",
 ]
+QUOTE_BUTTON_SELECTORS = [
+    "button.se-quotation-toolbar-button",
+    "button[data-name='quotation']",
+    ".se-toolbar-item-quotation button",
+]
+DIVIDER_BUTTON_SELECTORS = [
+    "button.se-horizontal-line-toolbar-button",
+    "button[data-name='horizontalLine']",
+    ".se-toolbar-item-horizontalLine button",
+]
 CLOSE_POPUP_SELECTORS = [
     ".se-popup-button-cancel",
     ".se-popup-button-close",
@@ -58,8 +68,8 @@ class NaverBlogError(RuntimeError):
 
 @dataclass
 class PostBlock:
-    kind: str  # "text" 또는 "image"
-    value: str  # 텍스트 내용 또는 이미지 파일 경로
+    kind: str  # text / image / quote / divider
+    value: str = ""  # 텍스트 내용 또는 이미지 파일 경로
 
 
 class NaverBlogPublisher:
@@ -186,6 +196,10 @@ class NaverBlogPublisher:
         for block in blocks:
             if block.kind == "image":
                 self._insert_image(page, frame, Path(block.value))
+            elif block.kind == "divider":
+                self._click_optional(frame, DIVIDER_BUTTON_SELECTORS)
+            elif block.kind == "quote":
+                self._insert_quote(page, frame, block.value)
             else:
                 self._paste_text(page, block.value)
                 page.keyboard.press("Enter")
@@ -212,6 +226,29 @@ class NaverBlogPublisher:
         pyperclip.copy(text)
         page.keyboard.press("Control+V")
         page.wait_for_timeout(500)
+
+    def _insert_quote(self, page: Page, frame: FrameLocator, text: str) -> None:
+        """인용구 컴포넌트를 못 찾으면 기호를 붙인 일반 텍스트로 대신한다."""
+        if self._click_optional(frame, QUOTE_BUTTON_SELECTORS):
+            page.wait_for_timeout(600)
+            self._paste_text(page, text)
+            page.keyboard.press("Enter")
+            page.keyboard.press("Enter")  # 인용구 블록에서 빠져나온다
+        else:
+            self._paste_text(page, f"❝ {text} ❞")
+            page.keyboard.press("Enter")
+
+    def _click_optional(self, scope: FrameLocator, selectors: list[str]) -> bool:
+        """있으면 누르고 없으면 조용히 넘어간다. 서식 요소는 실패해도 글은 살아야 한다."""
+        for selector in selectors:
+            try:
+                element = scope.locator(f"{selector} >> visible=true").first
+                element.wait_for(state="visible", timeout=3000)
+                element.click()
+                return True
+            except (PlaywrightTimeout, PlaywrightError):
+                continue
+        return False
 
     def _insert_image(self, page: Page, frame: FrameLocator, path: Path) -> None:
         if not path.exists():
