@@ -1,0 +1,8 @@
+.env
+storage/
+output/
+__pycache__/
+*.pyc
+
+# Bayer 사내 API 명세서. 외부에 공개하지 않는다.
+docs/
