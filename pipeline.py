@@ -1,15 +1,20 @@
 """전체 생성 파이프라인.
 
   1. 상품 페이지 수집 (텍스트 + 이미지 URL)
-  2. 상품 분석 -> ProductBrief
-  3. SEO 키워드 전략 -> SeoPlan
-  4. 11단 구조 집필 -> Article
-  5. 휴머나이징 (계측 -> 재작성)
-  6. 품질 평가. 기준 미달이면 피드백을 물려 재집필
-  7. 이미지 수집/평가/중복제거 -> 슬롯 배치
-  8. HTML + 네이버 블록으로 렌더링
+  2. 상세 이미지 내려받기 / 품질평가 / 중복제거
+  3. 상품 분석 -> ProductBrief
+  4. 상세페이지를 눈으로 확인하고 집중 포인트 3안 제시 -> 사용자가 선택
+  5. SEO 키워드 전략 -> SeoPlan
+  6. 11단 구조 집필 -> Article
+  7. 휴머나이징 (계측 -> 재작성)
+  8. 품질 평가. 기준 미달이면 지적 사항만 수정
+  9. 이미지 슬롯 배치
+ 10. HTML + 네이버 블록으로 렌더링
 
-진행 상황은 on_step 콜백으로 흘려보내 CLI 가 표시한다.
+이미지를 분석보다 먼저 내려받는 이유는, 상품 상세페이지의 설명 대부분이 이미지 안에
+글자로 박혀 있어서 그걸 봐야 집중 포인트를 제대로 고를 수 있기 때문이다.
+
+진행 상황은 report 콜백으로, 선택은 choose 콜백으로 CLI 에 넘긴다.
 """
 
 from __future__ import annotations
@@ -21,13 +26,15 @@ from pathlib import Path
 from typing import Callable
 
 import config
-from ai import analyst, critic, humanizer, reviser, seo as seo_mod, writer
+from ai import analyst, critic, focus as focus_mod, humanizer, reviser, seo as seo_mod, writer
 from ai.client import MyGenAssistClient
 from core.models import (
     KIND_CTA,
     KIND_IMAGE,
+    KIND_LINK,
     Article,
     Draft,
+    FocusPoint,
     ImageAsset,
     Product,
     ProductBrief,
@@ -42,12 +49,15 @@ from render import naver_blocks
 from scrape import product as product_scraper
 
 Reporter = Callable[[str], None]
+Chooser = Callable[[list[FocusPoint]], FocusPoint]
 
 
 @dataclass
 class PipelineResult:
     product: Product
     brief: ProductBrief
+    focus: FocusPoint | None
+    focus_options: list[FocusPoint]
     seo: SeoPlan
     draft: Draft
     images: dict[str, ImageAsset]
@@ -57,37 +67,51 @@ class PipelineResult:
 
 
 class Pipeline:
-    def __init__(self, *, report: Reporter | None = None):
+    def __init__(self, *, report: Reporter | None = None, choose: Chooser | None = None):
         self.report = report or (lambda _: None)
+        # 콜백이 없으면 첫 번째 안을 자동 선택한다 (비대화형 실행용).
+        self.choose = choose or (lambda options: options[0])
         self.ai_cfg = config.load_ai_config()
         self.img_cfg = config.load_image_config()
         self.gen_cfg = config.load_imagegen_config()
         self.post_cfg = config.load_post_config()
         self.quality_cfg = config.load_quality_config()
         self.client = MyGenAssistClient(self.ai_cfg)
+        self._processor = ImageProcessor(verify_ssl=self.ai_cfg.verify_ssl, proxies=self.ai_cfg.proxies)
 
     # ------------------------------------------------------------------ 실행
 
     def run(self, url: str, *, manual_desc: str = "", collect_images: bool = True) -> PipelineResult:
         product = self._collect_product(url, manual_desc, collect_images)
 
+        # 이미지를 먼저 내려받아야 해서 제목이 정해지기 전에 폴더를 만든다.
+        # 완성된 제목은 나중에 알게 되므로 그때 폴더 이름을 고쳐 단다.
+        stamp = f"{datetime.now():%Y%m%d_%H%M%S}"
+        run_dir = config.OUTPUT_DIR / f"{stamp}_{_slug(product.title)}"
+        available = self._prepare_images(product, run_dir)
+
         self.report("상품 분석 중 (특징·타깃·시나리오·장단점·FAQ)")
         brief = analyst.analyze(self.client, product)
         self.report(f"  카테고리: {brief.category} / 특징 {len(brief.features)}개 / FAQ {len(brief.faqs)}개")
 
+        focus, options = self._pick_focus(product, brief, available)
+
         self.report("SEO 키워드 전략 수립 중 (웹 검색 포함)")
-        seo = seo_mod.plan(self.client, product, brief)
+        seo = seo_mod.plan(self.client, product, brief, focus=focus)
         self.report(f"  메인 키워드: {seo.main_keyword} ({seo.search_type}, 경쟁도 {seo.competition})")
 
-        draft, attempts = self._write_until_good(product, brief, seo)
+        draft, attempts = self._write_until_good(product, brief, seo, focus)
 
-        run_dir = config.OUTPUT_DIR / f"{datetime.now():%Y%m%d_%H%M%S}_{_slug(draft.article.title)}"
-        images = self._place_images(product, brief, seo, draft.article, run_dir)
+        images = self._place_images(product, brief, seo, draft.article, run_dir, available)
+        run_dir = _rename_run_dir(run_dir, config.OUTPUT_DIR / f"{stamp}_{_slug(draft.article.title)}",
+                                  draft.article, images)
 
         ops = naver_blocks.render(draft.article)
-        self._save(run_dir, product, brief, seo, draft, attempts)
+        self._save(run_dir, product, brief, focus, options, seo, draft, attempts)
 
-        return PipelineResult(product, brief, seo, draft, images, ops, run_dir, attempts)
+        return PipelineResult(
+            product, brief, focus, options, seo, draft, images, ops, run_dir, attempts
+        )
 
     # -------------------------------------------------------------- 각 단계
 
@@ -111,8 +135,53 @@ class Pipeline:
         self.report(f"  본문 {len(product.body_text):,}자 / 스펙 {len(product.specs)}항목")
         return product
 
+    def _prepare_images(self, product: Product, run_dir: Path) -> list[ImageAsset]:
+        """상품 이미지를 미리 내려받아 평가·중복제거까지 마친다.
+
+        집중 포인트를 고를 때 AI 에게 상세 이미지를 보여줘야 해서 집필보다 먼저 돈다.
+        """
+        candidates = [ImageAsset(source="thumbnail", url=u) for u in product.thumbnail_urls[:6]]
+        candidates += [ImageAsset(source="detail", url=u) for u in product.detail_image_urls[:12]]
+        if not candidates:
+            return []
+
+        self.report(f"상품 이미지 {len(candidates)}개 내려받아 평가 중")
+        available = self._processor.prepare(candidates, run_dir / "images" / "product", referer=product.url)
+
+        by_source: dict[str, int] = {}
+        for asset in available:
+            by_source[asset.source] = by_source.get(asset.source, 0) + 1
+        self.report(f"  사용 가능 {len(available)}개 (중복 제거 후) {by_source}")
+        return available
+
+    def _pick_focus(
+        self, product: Product, brief: ProductBrief, available: list[ImageAsset]
+    ) -> tuple[FocusPoint | None, list[FocusPoint]]:
+        # 상세 이미지를 점수 순으로 몇 장만 보여준다. 비전 호출은 장당 비용이 크다.
+        details = sorted(
+            (a for a in available if a.source == "detail" and a.path),
+            key=lambda a: a.score,
+            reverse=True,
+        )
+        paths = [a.path for a in details[: focus_mod.MAX_VISION_IMAGES]]
+
+        if paths:
+            self.report(f"상세페이지 이미지 {len(paths)}장을 AI 가 직접 읽는 중")
+        else:
+            self.report("상세 이미지가 없어 본문 텍스트만으로 집중 포인트를 뽑습니다")
+
+        try:
+            options = focus_mod.propose(self.client, product, brief, paths)
+        except Exception as exc:
+            self.report(f"  집중 포인트 제안 실패({exc}). 포인트 없이 진행합니다.")
+            return None, []
+
+        chosen = self.choose(options)
+        self.report(f"  선택된 집중 포인트: {chosen.title}")
+        return chosen, options
+
     def _write_until_good(
-        self, product: Product, brief: ProductBrief, seo: SeoPlan
+        self, product: Product, brief: ProductBrief, seo: SeoPlan, focus: FocusPoint | None
     ) -> tuple[Draft, list[Draft]]:
         attempts: list[Draft] = []
         best: Draft | None = None
@@ -124,6 +193,7 @@ class Pipeline:
                 article = writer.write(
                     self.client, product, brief, seo,
                     self.post_cfg.persona, self.post_cfg.disclosure,
+                    focus=focus,
                 )
             else:
                 # 백지에서 다시 쓰면 잘 쓴 부분까지 날아간다. 지적된 곳만 고친다.
@@ -135,7 +205,7 @@ class Pipeline:
             report = humanizer.measure(article.body_text())
             if self.quality_cfg.humanize:
                 self.report("  AI 문체 계측 후 자연스럽게 다듬는 중")
-                article, report = humanizer.humanize(self.client, article, self.post_cfg.persona)
+                article, report = humanizer.humanize(self.client, article, self.post_cfg.persona, seo)
 
             seo_score = seo_mod.score(article, seo)
             self.report("  품질 평가 중")
@@ -162,26 +232,21 @@ class Pipeline:
         return best, attempts
 
     def _place_images(
-        self, product: Product, brief: ProductBrief, seo: SeoPlan, article: Article, run_dir: Path
+        self,
+        product: Product,
+        brief: ProductBrief,
+        seo: SeoPlan,
+        article: Article,
+        run_dir: Path,
+        available: list[ImageAsset],
     ) -> dict[str, ImageAsset]:
         slots = article.image_slots()
         if not slots:
             return {}
 
-        self.report(f"이미지 준비 중 (슬롯 {len(slots)}개)")
+        self.report(f"이미지 배치 중 (슬롯 {len(slots)}개)")
         image_dir = run_dir / "images"
-        processor = ImageProcessor(verify_ssl=self.ai_cfg.verify_ssl, proxies=self.ai_cfg.proxies)
-
-        candidates = [ImageAsset(source="thumbnail", url=u) for u in product.thumbnail_urls[:6]]
-        candidates += [ImageAsset(source="detail", url=u) for u in product.detail_image_urls[:12]]
-
-        available: list[ImageAsset] = []
-        if candidates:
-            available = processor.prepare(candidates, image_dir / "product", referer=product.url)
-            by_source = {}
-            for asset in available:
-                by_source[asset.source] = by_source.get(asset.source, 0) + 1
-            self.report(f"  사용 가능한 상품 이미지 {len(available)}개 (중복 제거 후) {by_source}")
+        processor = self._processor
 
         stock = None
         try:
@@ -198,9 +263,9 @@ class Pipeline:
         placed = planner.assign(slots, available, brief, stock_query=_stock_query(brief, seo))
 
         for block in article.blocks:
-            if block.kind == KIND_IMAGE and block.slot in placed:
+            if block.kind in (KIND_IMAGE, KIND_CTA) and block.slot in placed:
                 block.image = placed[block.slot]
-            elif block.kind == KIND_CTA and not block.href:
+            if block.kind in (KIND_CTA, KIND_LINK) and not block.href:
                 block.href = product.url
 
         # 이미지를 못 채운 슬롯은 빈 자리로 남기지 않고 지운다.
@@ -213,7 +278,9 @@ class Pipeline:
 
         return placed
 
-    def _save(self, run_dir: Path, product, brief, seo, draft: Draft, attempts: list[Draft]) -> None:
+    def _save(
+        self, run_dir: Path, product, brief, focus, options, seo, draft: Draft, attempts: list[Draft]
+    ) -> None:
         run_dir.mkdir(parents=True, exist_ok=True)
 
         (run_dir / "article.html").write_text(
@@ -236,6 +303,8 @@ class Pipeline:
                         "cons": brief.cons,
                         "faqs": [f.__dict__ for f in brief.faqs],
                     },
+                    "focus": focus.__dict__ if focus else None,
+                    "focus_options": [f.__dict__ for f in options],
                     "seo_plan": seo.__dict__,
                     "best": draft.to_dict(),
                     "attempts": [d.to_dict() for d in attempts],
@@ -247,6 +316,23 @@ class Pipeline:
             ),
             encoding="utf-8",
         )
+
+
+def _rename_run_dir(
+    current: Path, target: Path, article: Article, images: dict[str, ImageAsset]
+) -> Path:
+    """완성된 제목으로 폴더 이름을 바꾸고, 이미 잡혀 있는 이미지 경로를 따라 옮긴다."""
+    if current == target or not current.exists() or target.exists():
+        return current
+
+    current.rename(target)
+    for asset in [*images.values(), *(b.image for b in article.blocks if b.image)]:
+        if asset.path:
+            try:
+                asset.path = target / asset.path.relative_to(current)
+            except ValueError:
+                pass
+    return target
 
 
 def _stock_query(brief: ProductBrief, seo: SeoPlan) -> str:

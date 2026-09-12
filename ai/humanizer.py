@@ -17,7 +17,7 @@ import statistics
 
 from ai.client import MyGenAssistClient
 from ai.prompts import WRITER_RULES
-from core.models import KIND_CTA, KIND_PARAGRAPH, KIND_QUOTE, Article, HumannessReport
+from core.models import KIND_CTA, KIND_PARAGRAPH, KIND_QUOTE, Article, HumannessReport, SeoPlan
 
 #: 한국어 AI 생성문에서 유독 자주 튀어나오는 표현들.
 CLICHES = [
@@ -73,7 +73,9 @@ def measure(text: str) -> HumannessReport:
     return report
 
 
-def humanize(client: MyGenAssistClient, article: Article, persona: str) -> tuple[Article, HumannessReport]:
+def humanize(
+    client: MyGenAssistClient, article: Article, persona: str, seo: SeoPlan | None = None
+) -> tuple[Article, HumannessReport]:
     """계측 -> 재작성을 반복하되, 개선이 없으면 멈춘다."""
     report = measure(article.body_text())
 
@@ -81,11 +83,14 @@ def humanize(client: MyGenAssistClient, article: Article, persona: str) -> tuple
         if not report.needs_work:
             break
 
-        rewritten = _rewrite(client, article, persona, report)
+        rewritten = _rewrite(client, article, persona, report, seo)
         new_report = measure(rewritten.body_text())
 
         # 재작성이 오히려 나빠졌다면 이전 원고를 지킨다.
         if _grade(new_report) <= _grade(report):
+            break
+        # 문체가 좋아져도 검색 키워드를 잃었다면 손해다.
+        if _keyword_loss(article, rewritten, seo):
             break
 
         article, report = rewritten, new_report
@@ -93,16 +98,45 @@ def humanize(client: MyGenAssistClient, article: Article, persona: str) -> tuple
     return article, report
 
 
-def _rewrite(client: MyGenAssistClient, article: Article, persona: str, report: HumannessReport) -> Article:
+def _keyword_loss(before: Article, after: Article, seo: SeoPlan | None) -> bool:
+    """재작성으로 메인 키워드 노출이 줄었는지 본다. 도입부에서 사라지는 것도 손실로 본다."""
+    if not seo or not seo.main_keyword:
+        return False
+
+    old, new = before.body_text(), after.body_text()
+    main = seo.main_keyword
+    if new.count(main) < old.count(main):
+        return True
+    return main in old[:300] and main not in new[:300]
+
+
+def _rewrite(
+    client: MyGenAssistClient,
+    article: Article,
+    persona: str,
+    report: HumannessReport,
+    seo: SeoPlan | None = None,
+) -> Article:
     targets = [(i, b) for i, b in enumerate(article.blocks) if b.kind in _REWRITABLE and b.text]
     if not targets:
         return article
+
+    # 문체만 손보다가 검색 키워드를 날려 먹는 일이 잦아, 지켜야 할 표현을 못 박는다.
+    keep = ""
+    if seo:
+        terms = [k for k in [seo.main_keyword, *seo.sub_keywords[:5]] if k]
+        if terms:
+            keep = (
+                "\n[반드시 글자 그대로 남겨야 하는 표현. 개수를 줄이거나 다른 말로 "
+                f"바꾸지 마라]\n{', '.join(terms)}\n"
+            )
 
     numbered = "\n".join(f"[{i}] {b.text}" for i, b in targets)
     user = f"""아래는 블로그 원고의 문단들이다. 기계적으로 읽히는 부분을 사람이 쓴 것처럼 고쳐라.
 
 [글쓴이 페르소나]
 {persona}
+{keep}
 
 [문체 진단 결과. 이 지점들을 고쳐라]
 {report.as_instructions()}

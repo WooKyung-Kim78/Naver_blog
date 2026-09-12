@@ -17,6 +17,7 @@ from core.models import (
     KIND_FAQ,
     KIND_HEADING,
     KIND_IMAGE,
+    KIND_LINK,
     KIND_PARAGRAPH,
     KIND_QUOTE,
     KIND_TABLE,
@@ -92,8 +93,15 @@ def render(article: Article) -> list[Op]:
                 if block.image.credit:
                     text(f"({block.image.credit})")
 
+        elif kind == KIND_LINK:
+            # 네이버 에디터는 줄 단독으로 놓인 URL 을 자동으로 링크로 바꾼다.
+            text("\n".join([f"👉 {block.text}", block.href]))
+
         elif kind == KIND_CTA:
-            text("\n".join([RULE, f"👉 {block.text}", RULE]))
+            # 마지막 구매 안내는 썸네일을 먼저 보여주고 바로 아래에 링크를 붙인다.
+            if block.image and block.image.path:
+                ops.append(Op("image", str(block.image.path)))
+            text("\n".join([RULE, f"👉 {block.text}", block.href, RULE]))
 
     if article.tags:
         text("\n" + " ".join(f"#{t}" for t in article.tags))

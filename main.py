@@ -18,7 +18,7 @@ from rich.table import Table
 
 import config
 from ai.client import AIError, MyGenAssistClient
-from core.models import KIND_HEADING, KIND_IMAGE
+from core.models import KIND_CTA, KIND_HEADING, KIND_IMAGE, KIND_LINK, FocusPoint
 from pipeline import Pipeline, PipelineResult
 
 console = Console()
@@ -37,6 +37,7 @@ def main() -> int:
     post.add_argument("--no-images", action="store_true", help="상세페이지 이미지 수집 건너뛰기(빠름)")
     post.add_argument("--open", action="store_true", help="완성된 HTML 미리보기를 브라우저로 열기")
     post.add_argument("--debug", action="store_true", help="브라우저 스크린샷 저장")
+    post.add_argument("--auto-focus", action="store_true", help="집중 포인트를 묻지 않고 1안으로 진행")
 
     args = parser.parse_args()
 
@@ -125,7 +126,10 @@ def cmd_doctor() -> int:
 
 
 def cmd_post(args) -> int:
-    pipeline = Pipeline(report=lambda msg: console.print(f"  {msg}" if msg.startswith(" ") else f"[cyan]›[/cyan] {msg}"))
+    pipeline = Pipeline(
+        report=lambda msg: console.print(f"  {msg}" if msg.startswith(" ") else f"[cyan]›[/cyan] {msg}"),
+        choose=_choose_focus if not args.auto_focus else (lambda options: options[0]),
+    )
 
     desc = args.desc
     result = pipeline.run(args.url, manual_desc=desc, collect_images=not args.no_images)
@@ -161,6 +165,34 @@ def cmd_post(args) -> int:
     return 0
 
 
+def _choose_focus(options: list[FocusPoint]) -> FocusPoint:
+    """상세페이지를 읽고 뽑은 집중 포인트 후보를 보여주고 하나를 고르게 한다."""
+    console.print()
+    console.print(Panel(
+        "상세페이지를 확인해 이 글에서 집중할 포인트를 정리했습니다.\n"
+        "하나를 고르면 글 전체가 그 각도로 쓰입니다.",
+        title="집중 포인트 선택", border_style="cyan",
+    ))
+
+    for i, point in enumerate(options, 1):
+        body = [
+            f"[white]{point.angle}[/white]",
+            "",
+            f"[dim]근거[/dim]      {point.evidence}",
+            f"[dim]타깃[/dim]      {point.target}",
+            f"[dim]미는 이유[/dim] {point.why_now}",
+        ]
+        if point.keywords:
+            body.append(f"[dim]키워드[/dim]    {', '.join(point.keywords)}")
+        if point.risk:
+            body.append(f"[yellow]약점[/yellow]      {point.risk}")
+        console.print(Panel("\n".join(body), title=f"[bold]{i}. {point.title}[/bold]",
+                            title_align="left", border_style="white"))
+
+    valid = tuple(str(i) for i in range(1, len(options) + 1))
+    return options[int(_ask(f"어느 포인트로 쓸까요? ({'/'.join(valid)})", valid)) - 1]
+
+
 def _show_report(result: PipelineResult) -> None:
     article, draft, seo = result.draft.article, result.draft, result.seo
 
@@ -186,9 +218,17 @@ def _show_report(result: PipelineResult) -> None:
             structure.add_row(f"{'  ' * (block.level - 2)}H{block.level}", block.text)
         elif block.kind == KIND_IMAGE and block.image:
             structure.add_row("  이미지", f"{block.slot} ← {block.image.source}")
+        elif block.kind == KIND_LINK:
+            structure.add_row("  [green]구매링크[/green]", block.text)
+        elif block.kind == KIND_CTA:
+            thumb = f"썸네일({block.image.source})" if block.image else "[yellow]썸네일 없음[/yellow]"
+            structure.add_row("  [green]구매링크[/green]", f"{thumb} + {block.text[:40]}")
 
     console.print()
     console.print(Panel(f"[bold]{article.title}[/bold]", border_style="green"))
+    if result.focus:
+        console.print(Panel(f"{result.focus.title}\n[dim]{result.focus.angle}[/dim]",
+                            title="집중 포인트", title_align="left", border_style="cyan"))
     console.print(quality)
     console.print(seo_table)
     console.print(structure)

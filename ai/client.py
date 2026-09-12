@@ -8,13 +8,20 @@ docs/v3-api.yaml 기준:
 
 from __future__ import annotations
 
+import base64
+import io
 import json
 import re
 import time
+from pathlib import Path
 
 import requests
 
 from config import AIConfig
+
+#: 비전 입력으로 보낼 때 줄이는 가로 폭. 원본 그대로 보내면 토큰과 시간이 크게 늘고
+#: 상세페이지 글자를 읽는 데는 이 정도면 충분하다.
+VISION_MAX_WIDTH = 900
 
 
 class AIError(RuntimeError):
@@ -51,10 +58,11 @@ class MyGenAssistClient:
         max_tokens: int = 8000,
         json_mode: bool = False,
         websearch: bool | None = None,
+        images: list[Path] | None = None,
         retries: int = 2,
     ) -> str:
         payload = (
-            self._agent_payload(system, user, temperature, max_tokens, json_mode, websearch)
+            self._agent_payload(system, user, temperature, max_tokens, json_mode, websearch, images)
             if self.cfg.endpoint == "agent"
             else self._responses_payload(system, user, temperature, max_tokens, json_mode)
         )
@@ -72,16 +80,25 @@ class MyGenAssistClient:
                     time.sleep(2 * (attempt + 1))
         raise AIError(f"AI 호출에 실패했습니다: {last_error}")
 
-    def chat_json(self, system: str, user: str, **kwargs) -> dict | list:
+    def chat_json(self, system: str, user: str, **kwargs) -> dict | list:  # noqa: D401
         raw = self.chat(system, user, json_mode=self.cfg.supports_json_mode, **kwargs)
         return _parse_json(raw)
 
-    def _agent_payload(self, system, user, temperature, max_tokens, json_mode, websearch) -> dict:
+    def _agent_payload(self, system, user, temperature, max_tokens, json_mode, websearch, images=None) -> dict:
+        content: str | list = user
+        if images:
+            content = [{"type": "text", "text": user}]
+            content += [
+                {"type": "image_url", "image_url": {"url": data_uri, "detail": "high"}}
+                for data_uri in (encode_image(p) for p in images)
+                if data_uri
+            ]
+
         payload: dict = {
             "model": self.cfg.chat_model,
             "messages": [
                 {"role": "system", "content": system},
-                {"role": "user", "content": user},
+                {"role": "user", "content": content},
             ],
             "temperature": temperature,
             "max_tokens": max_tokens,
@@ -144,6 +161,24 @@ class MyGenAssistClient:
             return "".join(chunks)
 
         raise AIError(f"응답에서 텍스트를 찾지 못했습니다: {json.dumps(data)[:800]}")
+
+
+def encode_image(path: Path) -> str:
+    """이미지를 data URI 로 만든다. 실패하면 빈 문자열을 돌려 호출부가 건너뛰게 한다."""
+    try:
+        from PIL import Image
+
+        image = Image.open(path)
+        image.load()
+        if image.width > VISION_MAX_WIDTH:
+            ratio = VISION_MAX_WIDTH / image.width
+            image = image.resize((VISION_MAX_WIDTH, int(image.height * ratio)), Image.LANCZOS)
+
+        buffer = io.BytesIO()
+        image.convert("RGB").save(buffer, "JPEG", quality=72, optimize=True)
+        return f"data:image/jpeg;base64,{base64.b64encode(buffer.getvalue()).decode()}"
+    except Exception:
+        return ""
 
 
 def _parse_json(raw: str) -> dict | list:

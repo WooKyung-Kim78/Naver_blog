@@ -10,7 +10,15 @@ import re
 
 from ai.client import MyGenAssistClient
 from ai.prompts import BASE_RULES
-from core.models import Article, ProductBrief, Product, SeoPlan, SeoScore, KIND_HEADING
+from core.models import (
+    Article,
+    FocusPoint,
+    ProductBrief,
+    Product,
+    SeoPlan,
+    SeoScore,
+    KIND_HEADING,
+)
 
 #: 메인 키워드의 이상적인 밀도 구간(%). 이보다 낮으면 약하고, 높으면 남용으로 감점된다.
 DENSITY_MIN = 1.0
@@ -31,7 +39,22 @@ _SCHEMA = """{
 }"""
 
 
-def plan(client: MyGenAssistClient, product: Product, brief: ProductBrief) -> SeoPlan:
+def plan(
+    client: MyGenAssistClient,
+    product: Product,
+    brief: ProductBrief,
+    *,
+    focus: FocusPoint | None = None,
+) -> SeoPlan:
+    focus_block = ""
+    if focus:
+        hint = ", ".join(focus.keywords) or "(없음)"
+        focus_block = (
+            f"\n{focus.as_prompt()}\n"
+            f"[이 각도에서 나온 키워드 후보] {hint}\n"
+            "키워드와 소제목은 위 집중 포인트를 살리는 방향으로 잡는다.\n"
+        )
+
     user = f"""아래 상품으로 네이버 블로그 리뷰를 쓰려 한다.
 웹 검색으로 이 카테고리에서 한국 사람들이 실제로 검색하는 표현을 조사한 뒤 키워드 전략을 세워라.
 
@@ -40,13 +63,19 @@ def plan(client: MyGenAssistClient, product: Product, brief: ProductBrief) -> Se
 [한 줄 요약] {brief.one_liner}
 [주요 특징] {', '.join(f.name for f in brief.features)}
 [타깃] {', '.join(p.who for p in brief.personas)}
-
+{focus_block}
 요구사항.
 - main_keyword 는 검색량이 있으면서 개인 블로그가 노려볼 만한 것으로 고른다.
   너무 광범위한 단어(예: "골프")나 아무도 안 치는 긴 문장은 피한다.
+- sub_keywords 는 반드시 '문장 안에 그대로 써도 어색하지 않은' 표현이어야 한다.
+  메인 키워드 앞에 단어만 갖다 붙인 조합은 금지다.
+  나쁜 예: "골프 거리측정기 슬로프 보정", "골프 거리측정기 에이밍 기능"
+  좋은 예: "슬로프 보정", "에이밍 기능", "파인캐디 UPL2000", "골프 거리측정기 추천"
+  즉 기능·모델명·상황처럼 그 자체로 하나의 말이 되는 덩어리로 뽑는다.
 - h2s 는 아래 글 구조 순서에 맞춰 만든다.
   문제제기 / 상품소개 / 주요특징 / 실사용 / 장점 / 아쉬운점 / FAQ / 총평
-- h2 에는 키워드를 억지로 넣지 말고, 절반 정도만 자연스럽게 포함시킨다.
+- h2s 중 최소 절반에는 main_keyword 또는 sub_keywords 중 하나가 글자 그대로
+  들어가야 한다. 단, 소제목이 어색해질 정도로 밀어 넣지는 않는다.
 
 아래 JSON 형식으로만 출력한다.
 

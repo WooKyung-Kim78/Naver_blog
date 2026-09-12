@@ -88,6 +88,28 @@ class FAQ:
 
 
 @dataclass
+class FocusPoint:
+    """상세페이지를 읽고 뽑은 '이 글에서 밀어붙일 한 가지'. 사용자가 셋 중 하나를 고른다."""
+
+    title: str = ""
+    angle: str = ""
+    evidence: str = ""  # 상세페이지의 어떤 근거에서 나왔는지
+    target: str = ""
+    why_now: str = ""
+    keywords: list[str] = field(default_factory=list)
+    risk: str = ""  # 이 각도로 갔을 때의 약점
+
+    def as_prompt(self) -> str:
+        return (
+            f"[집중 포인트] {self.title}\n"
+            f"[접근] {self.angle}\n"
+            f"[근거] {self.evidence}\n"
+            f"[타깃] {self.target}\n"
+            f"[밀어야 하는 이유] {self.why_now}"
+        )
+
+
+@dataclass
 class ProductBrief:
     """AI 가 상품을 읽고 정리한 집필 설계도."""
 
@@ -181,7 +203,8 @@ KIND_TABLE = "table"
 KIND_FAQ = "faq"
 KIND_DIVIDER = "divider"
 KIND_IMAGE = "image"
-KIND_CTA = "cta"
+KIND_LINK = "link"  # 본문 중간에 끼워 넣는 구매 링크
+KIND_CTA = "cta"  # 글 끝의 썸네일 + 구매 링크
 
 
 @dataclass
@@ -199,9 +222,9 @@ class Block:
     headers: list[str] = field(default_factory=list)  # table 전용
     rows: list[list[str]] = field(default_factory=list)  # table 전용
     qa: list[FAQ] = field(default_factory=list)  # faq 전용
-    image: ImageAsset | None = None  # image 전용
+    image: ImageAsset | None = None  # image / cta 전용
     slot: str = ""  # 이미지 자리표시자
-    href: str = ""  # cta 전용
+    href: str = ""  # link / cta 전용
 
     @property
     def plain_text(self) -> str:
@@ -231,7 +254,8 @@ class Article:
         return len(self.body_text().replace(" ", ""))
 
     def image_slots(self) -> list[str]:
-        return [b.slot for b in self.blocks if b.kind == KIND_IMAGE and b.slot]
+        """이미지를 채워야 할 슬롯. 마지막 CTA 도 썸네일을 달아야 해서 포함한다."""
+        return [b.slot for b in self.blocks if b.kind in (KIND_IMAGE, KIND_CTA) and b.slot]
 
 
 # ------------------------------------------------------------------- 품질

@@ -17,6 +17,7 @@ from core.models import (
     KIND_FAQ,
     KIND_HEADING,
     KIND_IMAGE,
+    KIND_LINK,
     KIND_PARAGRAPH,
     KIND_QUOTE,
     KIND_TABLE,
@@ -57,9 +58,16 @@ th { background:#f8fafc; font-weight:600; }
 details { border:1px solid var(--line); border-radius:8px; margin-bottom:10px; }
 details summary { padding:14px 18px; cursor:pointer; font-weight:600; }
 details p { padding:0 18px 16px; margin:0; color:#374151; }
-.cta { margin:32px 0 8px; padding:22px; text-align:center; background:var(--accent);
-  color:#fff; border-radius:12px; font-size:17px; font-weight:600; }
-.cta a { color:#fff; text-decoration:none; }
+.buy-inline { margin:22px 0; padding:14px 18px; background:#f0fdf4; border:1px solid #bbf7d0;
+  border-radius:10px; text-align:center; }
+.buy-inline a { color:#166534; font-weight:600; text-decoration:none; }
+.buy-inline a:hover { text-decoration:underline; }
+.cta-card { display:block; margin:36px 0 8px; padding:24px; text-align:center;
+  border:2px solid var(--accent); border-radius:14px; text-decoration:none; color:var(--ink); }
+.cta-card img { width:260px; margin:0 auto 16px; border-radius:10px; }
+.cta-text { display:block; font-size:17px; margin-bottom:16px; }
+.cta-button { display:inline-block; padding:12px 32px; background:var(--accent); color:#fff;
+  border-radius:999px; font-weight:700; }
 .tags { margin-top:36px; padding-top:20px; border-top:1px solid var(--line);
   color:var(--muted); font-size:14px; }
 .seo { max-width:760px; margin:24px auto 0; padding:20px 24px; background:#fff;
@@ -152,10 +160,20 @@ def _block(block) -> str:
         cap_html = f"<figcaption>{escape(caption)}</figcaption>" if caption else ""
         return f'<figure><img src="{escape(src)}" alt="{escape(block.image.caption)}">{cap_html}</figure>'
 
+    if kind == KIND_LINK:
+        return (
+            f'<div class="buy-inline"><a href="{escape(block.href)}" target="_blank" rel="nofollow">'
+            f"👉 {escape(block.text)}</a></div>"
+        )
+
     if kind == KIND_CTA:
-        inner = escape(block.text)
-        if block.href:
-            inner = f'<a href="{escape(block.href)}">{inner}</a>'
-        return f'<div class="cta">{inner}</div>'
+        thumb = ""
+        if block.image and block.image.path:
+            thumb = f'<img src="{escape(block.image.path.as_posix())}" alt="상품 이미지">'
+        return (
+            f'<a class="cta-card" href="{escape(block.href)}" target="_blank" rel="nofollow">'
+            f'{thumb}<span class="cta-text">{escape(block.text)}</span>'
+            f'<span class="cta-button">상품 보러 가기</span></a>'
+        )
 
     return ""

@@ -9,6 +9,8 @@
 
 from __future__ import annotations
 
+import re
+
 from ai.client import MyGenAssistClient
 from ai.prompts import WRITER_RULES
 from core.models import (
@@ -19,6 +21,7 @@ from core.models import (
     KIND_FAQ,
     KIND_HEADING,
     KIND_IMAGE,
+    KIND_LINK,
     KIND_PARAGRAPH,
     KIND_QUOTE,
     KIND_TABLE,
@@ -30,6 +33,7 @@ from core.models import (
     SLOT_PRODUCT,
     Article,
     Block,
+    FocusPoint,
     ProductBrief,
     Product,
     SeoPlan,
@@ -57,7 +61,8 @@ _BACK_SCHEMA = """{
   "faq_lead": "FAQ 도입 한 문장",
   "verdict": "총평. 2문단. 누구에게 맞고 누구에겐 아닌지 분명히",
   "summary_box": ["3줄 요약", "각 줄 30자 내외", "3개"],
-  "cta": "구매 페이지로 유도하는 문장. 강매하지 않고 담백하게",
+  "mid_ctas": ["본문 중간에 넣을 링크 안내 문구", "2개. 각 30자 내외. 서로 다른 표현. URL 은 쓰지 마라"],
+  "cta": "구매 페이지로 유도하는 마지막 문장. 강매하지 않고 담백하게. URL 은 쓰지 마라",
   "tags": ["태그", "# 없이 8~12개"]
 }"""
 
@@ -70,6 +75,7 @@ def write(
     persona: str,
     disclosure: str,
     *,
+    focus: FocusPoint | None = None,
     feedback: str = "",
 ) -> Article:
     """앞부분과 뒷부분을 나눠 두 번 호출한다.
@@ -77,7 +83,7 @@ def write(
     추론 모델은 토큰 한도를 추론에 먼저 쓰기 때문에, 한 번에 긴 글을 요구하면
     중간에 잘린다. 나눠 쓰면 각 호출이 짧아지고 집중도도 올라간다.
     """
-    context = _context(product, brief, seo, persona, feedback)
+    context = _context(product, brief, seo, persona, focus, feedback)
 
     front = client.chat_json(
         WRITER_RULES,
@@ -86,7 +92,12 @@ def write(
 지금은 글의 앞부분만 쓴다. 도입부부터 주요 특징까지다.
 
 - hook 은 상품 자랑으로 시작하지 않는다. 독자의 상황이나 내 경험으로 연다.
-- intro 에 메인 키워드 '{seo.main_keyword}' 를 한 번 자연스럽게 넣는다.
+- hook 또는 intro 의 첫 문단 안에 메인 키워드 '{seo.main_keyword}' 가
+  이 글자 그대로 반드시 들어가야 한다. 검색 노출이 여기서 갈린다.
+- 메인 키워드 '{seo.main_keyword}' 는 이 구간 전체에서 정확히 {_front_quota(seo)}번만 쓴다.
+  같은 형태를 그대로 쓰되, 한 문단에 두 번 넣지 않는다. 더 많이 쓰면 검색엔진이
+  남용으로 보고 순위를 내린다.
+- 이 구간의 본문은 공백 제외 {int(TARGET_CHARS * 0.45):,}자 이상 써라. 짧으면 정보가 부실해진다.
 - 아래 키워드를 이 구간에 반드시 한 번씩 등장시킨다. 문장에 녹여 쓰고 나열하지 않는다.
   {', '.join(seo.sub_keywords[:3]) or '(없음)'}
 - feature_rows 는 4~6개. brief 의 features 를 근거로 한다.
@@ -111,7 +122,9 @@ def write(
 - verdict 에서 추천 대상과 비추천 대상을 모두 밝힌다.
 - 아래 키워드를 이 구간에 반드시 한 번씩 등장시킨다. 문장에 녹여 쓰고 나열하지 않는다.
   {', '.join(seo.sub_keywords[3:]) or '(없음)'}
-- 메인 키워드 '{seo.main_keyword}' 도 이 구간에 두 번쯤 자연스럽게 넣는다.
+- 메인 키워드 '{seo.main_keyword}' 는 이 구간에서 정확히 {_back_quota(seo)}번만 쓴다.
+  한 문단에 두 번 넣지 않는다. 남용하면 오히려 순위가 내려간다.
+- 이 구간의 본문은 공백 제외 {int(TARGET_CHARS * 0.55):,}자 이상 써라. 짧으면 정보가 부실해진다.
 
 아래 JSON 형식으로만 출력한다.
 
@@ -121,10 +134,37 @@ def write(
         websearch=False,
     )
 
-    return _assemble(front, back, brief, seo, disclosure)
+    return _assemble(front, back, brief, seo, disclosure, product.url)
 
 
-def _context(product: Product, brief: ProductBrief, seo: SeoPlan, persona: str, feedback: str) -> str:
+#: 메인 키워드가 노리는 밀도(%)와 완성 원고의 목표 길이. 이 둘로 반복 횟수를 역산한다.
+#: "자연스럽게 넣어라" 같은 말은 모델이 무시하지만, 횟수를 주면 대체로 지킨다.
+#: 다만 모델이 요구 횟수를 넘겨 쓰는 경향이 있어, 허용 구간(1.0~2.5%)의 아래쪽을 겨눈다.
+TARGET_DENSITY = 1.15
+TARGET_CHARS = 3200
+
+
+def _main_quota(seo: SeoPlan) -> int:
+    length = max(len(seo.main_keyword), 1)
+    return max(3, min(round(TARGET_DENSITY * TARGET_CHARS / (100 * length)), 8))
+
+
+def _front_quota(seo: SeoPlan) -> int:
+    return max(2, round(_main_quota(seo) * 0.45))
+
+
+def _back_quota(seo: SeoPlan) -> int:
+    return max(1, _main_quota(seo) - _front_quota(seo))
+
+
+def _context(
+    product: Product,
+    brief: ProductBrief,
+    seo: SeoPlan,
+    persona: str,
+    focus: FocusPoint | None,
+    feedback: str,
+) -> str:
     parts = [
         f"[상품] {product.title}",
         f"[가격] {product.price or '페이지 참고'}",
@@ -156,17 +196,33 @@ def _context(product: Product, brief: ProductBrief, seo: SeoPlan, persona: str, 
         "",
         f"[글쓴이 페르소나] {persona}",
     ]
+    if focus:
+        parts += [
+            "",
+            "[이 글이 집중할 한 가지. 글 전체가 여기로 수렴해야 한다]",
+            focus.as_prompt(),
+            "장점을 골고루 나열하지 말고 위 포인트를 중심으로 끌고 간다.",
+            "나머지 특징은 이 포인트를 뒷받침하는 근거로만 쓴다.",
+        ]
     if feedback:
         parts += ["", "[직전 원고의 문제점. 이번에는 반드시 고칠 것]", feedback]
     return "\n".join(parts)
 
 
-def _assemble(front: dict, back: dict, brief: ProductBrief, seo: SeoPlan, disclosure: str) -> Article:
+def _assemble(
+    front: dict, back: dict, brief: ProductBrief, seo: SeoPlan, disclosure: str, product_url: str
+) -> Article:
     h2 = _heading_picker(seo.h2s)
     blocks: list[Block] = []
+    # 링크는 렌더러가 따로 붙이므로, 모델이 문장에 끼워 넣은 URL 은 걷어낸다.
+    mid_ctas = [_no_url(t) for t in _strs(back.get("mid_ctas"))] or ["가격과 상세 사양 확인하기"]
 
     def add(kind: str, **kwargs) -> None:
         blocks.append(Block(kind=kind, **kwargs))
+
+    def buy_link(index: int) -> None:
+        """본문 중간 구매 링크. 독자가 읽다가 궁금해지는 지점마다 놓는다."""
+        add(KIND_LINK, text=mid_ctas[index % len(mid_ctas)], href=product_url)
 
     # 대가성 문구는 법적 의무라 항상 맨 위 고정이다.
     add(KIND_CALLOUT, text=disclosure, style="info")
@@ -200,6 +256,7 @@ def _assemble(front: dict, back: dict, brief: ProductBrief, seo: SeoPlan, disclo
         add(KIND_TABLE, headers=["항목", "내용", "포인트"], rows=rows)
     add(KIND_IMAGE, slot=SLOT_FEATURE)
     _add_paragraphs(blocks, front.get("feature_body"))
+    buy_link(0)
 
     # 실사용 시나리오
     add(KIND_HEADING, text=h2("실사용", "실제로 써보니"), level=2)
@@ -219,6 +276,7 @@ def _assemble(front: dict, back: dict, brief: ProductBrief, seo: SeoPlan, disclo
     pros = _strs(back.get("pros_items")) or brief.pros
     if pros:
         add(KIND_CHECKLIST, items=pros)
+    buy_link(1)
 
     # 아쉬운 점
     add(KIND_HEADING, text=h2("아쉬운", "아쉬운 점"), level=2)
@@ -242,15 +300,20 @@ def _assemble(front: dict, back: dict, brief: ProductBrief, seo: SeoPlan, disclo
     if summary:
         add(KIND_CALLOUT, text="\n".join(summary), style="summary")
 
-    # CTA
-    add(KIND_IMAGE, slot=SLOT_CTA)
-    if _s(back.get("cta")):
-        add(KIND_CTA, text=_s(back["cta"]))
+    # CTA. 마지막 구매 링크는 썸네일과 함께 보여준다. 이미지는 planner 가 채운다.
+    add(
+        KIND_CTA,
+        text=_no_url(_s(back.get("cta"))) or "제품 상세 정보와 구성품은 판매 페이지에서 확인해 보세요.",
+        href=product_url,
+        slot=SLOT_CTA,
+        style="final",
+    )
 
     return Article(
         title=_s(front.get("title")) or seo.h1 or seo.main_keyword,
         blocks=blocks,
-        tags=_strs(back.get("tags")),
+        # 네이버는 띄어쓰기를 태그 구분자로 읽어 "#골프 거리측정기" 를 두 태그로 쪼갠다.
+        tags=list(dict.fromkeys(t.lstrip("#").replace(" ", "") for t in _strs(back.get("tags")))),
         disclosure=disclosure,
     )
 
@@ -274,6 +337,13 @@ def _add_paragraphs(blocks: list[Block], raw: object) -> None:
         text = chunk.strip()
         if text:
             blocks.append(Block(kind=KIND_PARAGRAPH, text=text))
+
+
+def _no_url(text: str) -> str:
+    """문장에 섞여 들어온 URL 과 그 앞의 안내 꼬리('구매 페이지:')를 떼어낸다."""
+    cleaned = re.sub(r"\s*\S*(?:https?://|www\.)\S+", "", text)
+    cleaned = re.sub(r"[\s,]*(?:구매|판매|상품|제품)\s*(?:페이지|링크)\s*[:：]?\s*$", "", cleaned)
+    return cleaned.strip(" ,·-—:：")
 
 
 def _s(value: object) -> str:
