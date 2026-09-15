@@ -81,6 +81,9 @@ class NaverBlogPublisher:
         self._browser = None
         self._context = None
         self.page: Page | None = None
+        # 로그인에 성공했을 때만 세션을 저장한다. 실패한 쿠키를 덮어쓰면
+        # 다음에도 '로그인한 것처럼' 에디터로 넘어가게 된다.
+        self._logged_in = False
 
     def __enter__(self) -> "NaverBlogPublisher":
         self._pw = sync_playwright().start()
@@ -109,12 +112,15 @@ class NaverBlogPublisher:
         self.page.set_default_timeout(30_000)
         return self
 
-    def __exit__(self, *exc) -> None:
-        try:
-            if self._context:
-                self._context.storage_state(path=str(SESSION_FILE))
-        except PlaywrightError:
-            pass
+    def __exit__(self, exc_type, *exc) -> None:
+        self._persist_session()
+        if self.cfg.headed and exc_type and self.page:
+            print(f"\n  현재 주소: {self.page.url}")
+            print("  브라우저 창을 확인한 뒤 Enter 를 누르면 닫습니다.")
+            try:
+                input("  Enter > ")
+            except EOFError:
+                pass
         for closer in (self._context, self._browser):
             try:
                 closer and closer.close()
@@ -126,19 +132,129 @@ class NaverBlogPublisher:
     # ------------------------------------------------------------------ 로그인
 
     def ensure_login(self) -> None:
-        if self._is_logged_in():
+        """쿠키만 보지 않는다. 글쓰기 화면이 실제로 열려야 로그인한 것이다.
+
+        만료된 세션 파일에도 NID_AUT / NID_SES 가 남아 있어서, 쿠키만 보면
+        실패한 로그인을 성공으로 착각하고 에디터 입력으로 넘어간다.
+        """
+        if self._editor_is_open():
+            self._mark_logged_in()
             return
+
         self._login_with_credentials()
-        if not self._is_logged_in():
+        self._wait_for_login_to_finish()
+
+        if self._login_form_visible():
             raise NaverBlogError(
-                "네이버 로그인에 실패했습니다. 캡차가 떴거나 2단계 인증이 걸렸을 수 있습니다.\n"
-                "BROWSER_HEADED=true 로 두고 다시 실행한 뒤, 창이 뜨면 직접 로그인을 완료해 주세요."
+                "네이버 로그인에 실패했습니다. 아직 아이디·비밀번호 입력란이 보입니다.\n"
+                f"  현재 주소: {self.page.url}\n"
+                "캡차나 2단계 인증을 창에서 끝낸 뒤, 네이버 홈이 보일 때까지 기다렸다가 Enter 를 누르세요."
             )
 
-    def _is_logged_in(self) -> bool:
-        self.page.goto("https://www.naver.com", wait_until="domcontentloaded")
-        names = {c["name"] for c in self._context.cookies()}
+        self._mark_logged_in()
+
+        if not self._editor_is_open():
+            raise NaverBlogError(
+                "로그인은 됐지만 글쓰기 화면을 열지 못했습니다. 세션은 저장해 두었습니다.\n"
+                f"  현재 주소: {self.page.url}\n"
+                "NAVER_BLOG_ID 가 blog.naver.com/뒤에 붙는 아이디와 같은지 확인해 주세요.\n"
+                "python main.py upload 로 다시 올리면 로그인은 건너뜁니다."
+            )
+
+    def _login_form_visible(self) -> bool:
+        """주소에 nidlogin 이 남아 있어도, 입력란이 없으면 로그인은 끝난 것이다."""
+        page = self.page
+        if not page or page.is_closed():
+            return False
+        try:
+            return page.locator("#id").first.is_visible(timeout=800)
+        except (PlaywrightTimeout, PlaywrightError):
+            return False
+
+    def _url_looks_like_login(self) -> bool:
+        url = (self.page.url or "").lower()
+        return "nidlogin.login" in url or "/nidlogin" in url
+
+    def _has_auth_cookie(self) -> bool:
+        if not self._context:
+            return False
+        try:
+            names = {c.get("name") for c in self._context.cookies()}
+        except PlaywrightError:
+            return False
         return "NID_AUT" in names and "NID_SES" in names
+
+    def _adopt_newest_page(self) -> None:
+        """로그인 후 새 탭이 열리면 그쪽으로 옮긴다."""
+        if not self._context:
+            return
+        pages = [p for p in self._context.pages if not p.is_closed()]
+        if not pages:
+            return
+        for candidate in reversed(pages):
+            try:
+                url = (candidate.url or "").lower()
+            except PlaywrightError:
+                continue
+            if url and url != "about:blank" and "nidlogin" not in url:
+                self.page = candidate
+                return
+        self.page = pages[-1]
+
+    def _wait_for_login_to_finish(self, timeout_ms: int = 25_000) -> None:
+        """Enter 직후에도 리다이렉트가 끝나길 기다린다."""
+        deadline = time.monotonic() + timeout_ms / 1000
+        while time.monotonic() < deadline:
+            self._adopt_newest_page()
+            form = self._login_form_visible()
+            if not form and (self._has_auth_cookie() or not self._url_looks_like_login()):
+                self.page.wait_for_timeout(800)
+                self._adopt_newest_page()
+                return
+            self.page.wait_for_timeout(400)
+
+    def _mark_logged_in(self) -> None:
+        self._logged_in = True
+        self._persist_session()
+
+    def _persist_session(self) -> None:
+        if not (self._context and self._logged_in):
+            return
+        try:
+            SESSION_FILE.parent.mkdir(parents=True, exist_ok=True)
+            self._context.storage_state(path=str(SESSION_FILE))
+        except PlaywrightError:
+            pass
+
+    def _editor_is_open(self) -> bool:
+        """글쓰기 주소로 가서 에디터 프레임이 보이는지 확인한다."""
+        page = self.page
+        for write_url in (
+            f"https://blog.naver.com/{self.cfg.blog_id}?Redirect=Write&",
+            f"https://blog.naver.com/{self.cfg.blog_id}/postwrite",
+        ):
+            try:
+                page.goto(write_url, wait_until="domcontentloaded")
+            except PlaywrightError:
+                continue
+            page.wait_for_timeout(2500)
+            if self._login_form_visible() or self._url_looks_like_login():
+                return False
+            if self._find_editor(page):
+                return True
+        return False
+
+    def _find_editor(self, page: Page) -> bool:
+        scopes: list[FrameLocator | Page] = [page.frame_locator("#mainFrame"), page]
+        for scope in scopes:
+            for selector in TITLE_SELECTORS + BODY_SELECTORS:
+                try:
+                    element = scope.locator(f"{selector} >> visible=true").first
+                    element.wait_for(state="visible", timeout=3500)
+                    return True
+                except (PlaywrightTimeout, PlaywrightError):
+                    continue
+        return False
 
     def _login_with_credentials(self) -> None:
         page = self.page
@@ -160,10 +276,19 @@ class NaverBlogPublisher:
                 pass
             page.wait_for_timeout(2000)
 
-        if "nidlogin" in page.url and self.cfg.headed:
-            print("\n  [!] 캡차 또는 추가 인증이 감지되었습니다.")
-            print("      브라우저 창에서 직접 로그인을 완료한 뒤 이 창에서 Enter 를 눌러주세요.")
-            input("      완료했으면 Enter > ")
+        if self._login_form_visible() or self._url_looks_like_login():
+            if self.cfg.headed:
+                print("\n  [!] 캡차 또는 추가 인증이 감지되었습니다.")
+                print("      브라우저 창에서 직접 로그인을 끝낸 뒤,")
+                print("      네이버 홈(또는 블로그)이 보이면 이 창에서 Enter 를 눌러주세요.")
+                try:
+                    input("      완료했으면 Enter > ")
+                except EOFError:
+                    pass
+                print("      로그인 결과를 확인하는 중...")
+            else:
+                print("\n  [!] 로그인 페이지에 머물러 있습니다. 캡차가 떴을 수 있습니다.")
+                print("      BROWSER_HEADED=true 로 바꾸고 다시 실행해 창에서 직접 로그인하세요.")
 
         self._snap("after_login")
 

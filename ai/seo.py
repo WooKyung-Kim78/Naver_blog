@@ -45,6 +45,8 @@ def plan(
     brief: ProductBrief,
     *,
     focus: FocusPoint | None = None,
+    extra_titles: list[str] | None = None,
+    theme: str = "",
 ) -> SeoPlan:
     focus_block = ""
     if focus:
@@ -57,11 +59,28 @@ def plan(
             "'골프 거리측정기 슬로프 보정 추천' 같은 조합은 아무도 검색하지 않는다.\n"
         )
 
-    user = f"""아래 상품으로 네이버 블로그 리뷰를 쓰려 한다.
-웹 검색으로 이 카테고리에서 한국 사람들이 실제로 검색하는 표현을 조사한 뒤 키워드 전략을 세워라.
+    if extra_titles:
+        names = " / ".join([product.title, *extra_titles])
+        opener = (
+            f"아래 상품들을 한 편의 추천 글로 묶어 쓰려 한다.\n"
+            f"웹 검색으로 이 쓰임새에서 한국 사람들이 실제로 검색하는 표현을 조사한 뒤 "
+            f"키워드 전략을 세워라.\n\n"
+            f"[묶어 소개할 상품] {names}\n"
+            f"[조합 테마] {theme or brief.category}\n"
+        )
+        structure = (
+            "공통점 / 같이 쓰는 장면 / 상품소개 / 비교 / 추천대상 / FAQ / 총평"
+        )
+    else:
+        opener = (
+            "아래 상품으로 네이버 블로그 리뷰를 쓰려 한다.\n"
+            "웹 검색으로 이 카테고리에서 한국 사람들이 실제로 검색하는 표현을 조사한 뒤 "
+            "키워드 전략을 세워라.\n\n"
+            f"[상품] {product.title}\n"
+        )
+        structure = "문제제기 / 상품소개 / 주요특징 / 실사용 / 장점 / 아쉬운점 / FAQ / 총평"
 
-[상품] {product.title}
-[카테고리] {brief.category}
+    user = f"""{opener}[카테고리] {brief.category}
 [한 줄 요약] {brief.one_liner}
 [주요 특징] {', '.join(f.name for f in brief.features)}
 [타깃] {', '.join(p.who for p in brief.personas)}
@@ -72,13 +91,14 @@ def plan(
 - main_keyword 를 모델명만으로 잡지 마라. 리뷰 글은 제품명을 어차피 수십 번 쓰게 되어
   밀도가 터진다. 모델명은 sub_keywords 에 넣고, main_keyword 는 "카테고리 + 의도"
   형태로 잡아라. 예: 모델명 "파인캐디 UPL2000" -> 메인 "골프 거리측정기 추천".
+  여러 상품을 묶을 때는 쓰임새가 메인이다. 예: "골프 입문 용품 추천".
 - sub_keywords 는 반드시 '문장 안에 그대로 써도 어색하지 않은' 표현이어야 한다.
   메인 키워드 앞에 단어만 갖다 붙인 조합은 금지다.
   나쁜 예: "골프 거리측정기 슬로프 보정", "골프 거리측정기 에이밍 기능"
   좋은 예: "슬로프 보정", "에이밍 기능", "파인캐디 UPL2000", "골프 거리측정기 추천"
   즉 기능·모델명·상황처럼 그 자체로 하나의 말이 되는 덩어리로 뽑는다.
 - h2s 는 아래 글 구조 순서에 맞춰 만든다.
-  문제제기 / 상품소개 / 주요특징 / 실사용 / 장점 / 아쉬운점 / FAQ / 총평
+  {structure}
 - h2s 중 최소 절반에는 main_keyword 또는 sub_keywords 중 하나가 글자 그대로
   들어가야 한다. 단, 소제목이 어색해질 정도로 밀어 넣지는 않는다.
 

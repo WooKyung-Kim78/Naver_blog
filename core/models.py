@@ -125,6 +125,20 @@ class FocusChoice:
 
 
 @dataclass
+class RoundupBrief:
+    """여러 상품을 한 글로 묶을 때, 공통점과 조합 이유를 정리한 설계도."""
+
+    theme: str = ""
+    one_liner: str = ""
+    commonalities: list[str] = field(default_factory=list)
+    differences: list[str] = field(default_factory=list)
+    how_together: str = ""  # 같이 쓰면 어떻게 쓰는지
+    recommended_for: list[str] = field(default_factory=list)
+    not_recommended_for: list[str] = field(default_factory=list)
+    faqs: list[FAQ] = field(default_factory=list)
+
+
+@dataclass
 class ProductBrief:
     """AI 가 상품을 읽고 정리한 집필 설계도."""
 
@@ -199,6 +213,7 @@ class ImageAsset:
     credit: str = ""
     slot: str = ""
     prompt: str = ""
+    owner: str = ""  # 묶어 쓸 때 어느 상품 이미지인지. "0", "1"...
 
     @property
     def priority(self) -> int:

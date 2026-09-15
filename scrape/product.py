@@ -71,16 +71,50 @@ class ProductUnavailable(RuntimeError):
 
 def fetch(url: str, *, verify_ssl: bool = True, proxies: dict | None = None) -> Product:
     """페이지를 긁어온다. 문제가 있어도 여기서 막지 않고 diagnose 로 판단한다."""
-    html = _fetch_static(url, verify_ssl=verify_ssl, proxies=proxies)
-    product = _parse(url, html) if html else Product(url=url)
+    product = Product(url=url)
 
-    if len(product.body_text) < MIN_TEXT_LENGTH:
-        rendered, final_url = _fetch_rendered(url)
+    # 네이버 커머스는 정적 요청이 429 를 잘 받고, 화면 본문도 자주 비운다.
+    # 브라우저로 연 뒤 스크롤 전에 페이지가 들고 있는 상품 JSON 을 읽는다.
+    if _is_naver_commerce(url):
+        rendered, final_url, state = _fetch_rendered(url)
         if rendered:
             product = _merge(product, _parse(url, rendered))
-        product.resolved_url = final_url
+        product.resolved_url = final_url or product.resolved_url
+        if state:
+            from scrape import naver_state
+
+            naver_state.apply(product, state)
+        return product
+
+    html = _fetch_static(url, verify_ssl=verify_ssl, proxies=proxies)
+    if html:
+        product = _merge(product, _parse(url, html))
+
+    if len(product.body_text) < MIN_TEXT_LENGTH:
+        rendered, final_url, state = _fetch_rendered(url)
+        if rendered:
+            product = _merge(product, _parse(url, rendered))
+        product.resolved_url = final_url or product.resolved_url
+        if state:
+            from scrape import naver_state
+
+            naver_state.apply(product, state)
 
     return product
+
+
+def _is_naver_commerce(url: str) -> bool:
+    host = (url or "").lower()
+    return any(
+        token in host
+        for token in (
+            "naver.me",
+            "brandconnect.naver.com",
+            "smartstore.naver.com",
+            "brand.naver.com",
+            "shopping.naver.com",
+        )
+    )
 
 
 def diagnose(product: Product) -> str:
@@ -88,7 +122,16 @@ def diagnose(product: Product) -> str:
 
     안내문은 페이지 맨 앞에 뜨므로 본문 앞부분만 본다. 뒤쪽 후기까지 뒤지면
     "찾을 수 없었는데" 같은 평범한 문장에 걸려 멀쩡한 상품을 막게 된다.
+
+    화면은 오류여도 상품 JSON 에서 이름·가격·이미지를 이미 읽은 경우는 통과시킨다.
     """
+    if (
+        product.title
+        and not _is_generic_title(product.title)
+        and (product.price or product.thumbnail_urls)
+    ):
+        return ""
+
     landed = (product.resolved_url or "").lower()
     if any(m in landed for m in LOGIN_WALL_MARKERS):
         return "네이버가 로그인 페이지로 돌려보냈습니다 (자동 접근 차단)"
@@ -120,51 +163,43 @@ def _fetch_static(url: str, *, verify_ssl: bool, proxies: dict | None) -> str:
         return ""
 
 
-def _fetch_rendered(url: str) -> tuple[str, str]:
-    """렌더링한 HTML 과, 리다이렉트를 다 따라간 최종 주소를 함께 돌려준다."""
+def _fetch_rendered(url: str) -> tuple[str, str, dict]:
+    """렌더링한 HTML, 최종 주소, 스마트스토어 상품 JSON 을 함께 돌려준다."""
     try:
         from playwright.sync_api import sync_playwright
+
+        from scrape.browser import new_context
+        from scrape import naver_state
     except ImportError:
-        return "", ""
+        return "", "", {}
 
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=True,
-                args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
-            )
-            context = browser.new_context(
-                user_agent=UA,
-                locale="ko-KR",
-                timezone_id="Asia/Seoul",
-                viewport={"width": 1440, "height": 950},
-                extra_http_headers={"Accept-Language": "ko-KR,ko;q=0.9"},
-            )
-            context.add_init_script(
-                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
-                "Object.defineProperty(navigator, 'languages', {get: () => ['ko-KR', 'ko']});"
-                "Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});"
-            )
+            browser, context = new_context(p)
             page = context.new_page()
             page.goto(url, wait_until="domcontentloaded", timeout=45_000)
             page.wait_for_timeout(3000)
 
-            # 스크롤은 지연 로딩된 본문을 더 끌어오지만, 차단 상태에서는 그 요청이
-            # 실패하면서 페이지가 '상품이 존재하지 않습니다' 로 갈아치워진다.
-            # 그래서 스크롤 전 상태를 들고 있다가, 망가지면 그걸 쓴다.
+            # 스크롤하기 전에 JSON 을 읽는다. 스크롤이 페이지를 오류 화면으로
+            # 바꿔도 이미 읽어 둔 상품명·가격·이미지는 남는다.
+            state = naver_state.read_from_page(page)
             html, final_url = page.content(), page.url
-            for _ in range(4):
-                page.mouse.wheel(0, 2500)
-                page.wait_for_timeout(1200)
-                grown = page.content()
-                if _looks_dead(grown):
-                    break
-                html, final_url = grown, page.url
+
+            if not _looks_dead(html):
+                for _ in range(4):
+                    page.mouse.wheel(0, 2500)
+                    page.wait_for_timeout(1200)
+                    grown = page.content()
+                    if _looks_dead(grown):
+                        break
+                    html, final_url = grown, page.url
+                    if not state:
+                        state = naver_state.read_from_page(page)
 
             browser.close()
-            return html, final_url
+            return html, final_url, state or {}
     except Exception:
-        return "", ""
+        return "", "", {}
 
 
 def _looks_dead(html: str) -> bool:

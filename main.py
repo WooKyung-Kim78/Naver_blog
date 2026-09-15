@@ -4,6 +4,9 @@
     python main.py doctor                      설정과 API 연결 상태 점검
     python main.py post --url <상품 URL>        생성 후 네이버에 업로드
     python main.py post --url <URL> --dry-run   업로드 없이 원고와 이미지만 생성
+    python main.py upload                      이미 만든 결과물을 네이버에 임시저장/발행
+    python main.py upload --from output/폴더    특정 결과물만 다시 올리기
+    python main.py upload --md 제안.md          수정 제안 마크다운으로 article 을 다시 쓴 뒤 올리기
 """
 
 from __future__ import annotations
@@ -11,6 +14,7 @@ from __future__ import annotations
 import argparse
 import sys
 import webbrowser
+from pathlib import Path
 
 from rich.console import Console
 from rich.panel import Panel
@@ -19,8 +23,9 @@ from rich.table import Table
 import config
 from ai.client import AIError, MyGenAssistClient
 from core.models import KIND_CTA, KIND_HEADING, KIND_IMAGE, KIND_LINK, FocusChoice, FocusPoint
-from pipeline import Pipeline, PipelineResult
+from pipeline import MAX_PRODUCTS, Pipeline, PipelineResult
 from scrape.product import ProductUnavailable
+from publish.naver_blog import NaverBlogError
 
 console = Console()
 
@@ -32,25 +37,50 @@ def main() -> int:
     sub.add_parser("doctor", help="설정과 API 연결 점검")
 
     post = sub.add_parser("post", help="상품 URL 로 리뷰 생성")
-    post.add_argument("--url", required=True, help="본문에 넣을 구매 링크 (브랜드 커넥트 제휴 링크)")
-    post.add_argument("--page-url", default="",
-                      help="내용을 긁어올 실제 상품 페이지. 생략하면 물어본다")
+    post.add_argument(
+        "--url", action="append", required=True, dest="urls",
+        help="본문에 넣을 구매 링크. 여러 번 주면 묶어 한 글로 쓴다 (최대 4개)",
+    )
+    post.add_argument(
+        "--page-url", action="append", default=[], dest="page_urls",
+        help="내용을 긁어올 실제 상품 페이지. --url 과 같은 순서로. 생략하면 물어본다",
+    )
     post.add_argument("--desc", default="", help="상품 설명 직접 입력(사이트가 크롤링을 막을 때)")
     post.add_argument("--dry-run", action="store_true", help="네이버에 올리지 않고 원고만 생성")
     post.add_argument("--no-images", action="store_true", help="상세페이지 이미지 수집 건너뛰기(빠름)")
     post.add_argument("--open", action="store_true", help="완성된 HTML 미리보기를 브라우저로 열기")
+    post.add_argument("--md", dest="md_path", default="", help="수정 제안 마크다운. 있으면 그 제안으로 article 을 다시 쓴 뒤 올린다")
     post.add_argument("--debug", action="store_true", help="브라우저 스크린샷 저장")
     post.add_argument("--auto-focus", action="store_true", help="집중 포인트를 묻지 않고 1안으로 진행")
+
+    upload = sub.add_parser("upload", help="이미 만든 결과물을 네이버에 올리기 (원고 생성 생략)")
+    upload.add_argument(
+        "--from", dest="run_dir", default="",
+        help="결과 폴더. 생략하면 output/ 에서 가장 최근 것을 쓴다",
+    )
+    upload.add_argument("--md", dest="md_path", default="", help="수정 제안 마크다운. 있으면 그 제안으로 article 을 다시 쓴 뒤 올린다")
+    upload.add_argument("--debug", action="store_true", help="브라우저 스크린샷 저장")
 
     args = parser.parse_args()
 
     try:
-        return cmd_doctor() if args.command == "doctor" else cmd_post(args)
+        if args.command == "doctor":
+            return cmd_doctor()
+        if args.command == "upload":
+            return cmd_upload(args)
+        return cmd_post(args)
     except KeyboardInterrupt:
         console.print("\n[yellow]중단되었습니다.[/yellow]")
         return 130
     except config.ConfigError as exc:
         console.print(f"\n[red]설정 오류:[/red] {exc}")
+        return 1
+    except FileNotFoundError as exc:
+        console.print(f"\n[red]결과물을 찾지 못했습니다:[/red] {exc}")
+        return 1
+    except NaverBlogError as exc:
+        console.print()
+        console.print(Panel(str(exc), title="네이버 업로드 실패", title_align="left", border_style="red"))
         return 1
     except ProductUnavailable as exc:
         console.print()
@@ -139,48 +169,196 @@ def cmd_post(args) -> int:
         choose=(lambda options: FocusChoice(point=options[0])) if args.auto_focus else _choose_focus,
     )
 
-    page_url = args.page_url or _ask_page_url(args.url)
-    result = pipeline.run(
-        args.url, page_url=page_url, manual_desc=args.desc, collect_images=not args.no_images
-    )
+    urls = args.urls
+    if len(urls) > MAX_PRODUCTS:
+        console.print(f"[red]한 글에 묶을 상품은 {MAX_PRODUCTS}개까지입니다.[/red] 지금은 {len(urls)}개입니다.")
+        return 1
+
+    if len(urls) == 1:
+        page_url = _match_page_url(urls[0], args.page_urls) or _ask_page_url(urls[0])
+        result = pipeline.run(
+            urls[0], page_url=page_url, manual_desc=args.desc, collect_images=not args.no_images
+        )
+    else:
+        if args.desc:
+            console.print("[yellow]여러 상품을 묶을 때는 --desc 를 쓰지 않습니다. 상품마다 페이지를 읽습니다.[/yellow]")
+        items = []
+        for i, buy in enumerate(urls, 1):
+            page = ""
+            if len(args.page_urls) == len(urls):
+                page = args.page_urls[i - 1]
+            else:
+                page = _ask_page_url(buy, index=i, total=len(urls))
+            items.append((buy, page, ""))
+        result = pipeline.run_roundup(items, collect_images=not args.no_images)
 
     _show_report(result)
     console.print(f"\n결과 저장 위치: [white]{result.run_dir}[/white]")
-    console.print("  article.html  미리보기 / naver.txt  업로드될 내용 / report.json  분석 데이터")
-
-    if args.open:
-        webbrowser.open((result.run_dir / "article.html").as_uri())
+    console.print("  article.html  미리보기 / suggestions.md  수정 제안 / naver.txt  업로드될 내용")
+    console.print(f"  업로드만 다시 하려면: [white]python main.py upload --from {result.run_dir}[/white]")
 
     if args.dry_run:
+        if args.open:
+            webbrowser.open((result.run_dir / "article.html").as_uri())
         console.print("\n[yellow]--dry-run 이므로 네이버에는 올리지 않았습니다.[/yellow]")
+        console.print(f"  고친 뒤 올리려면: python main.py upload --from {result.run_dir}")
         return 0
+
+    from publish.naver_blog import PostBlock
+
+    payload = [PostBlock(kind=op.kind, value=op.value) for op in result.ops]
+    return _upload_to_naver(
+        result.draft.article.title,
+        result.draft.article.tags,
+        payload,
+        run_dir=result.run_dir,
+        debug=args.debug,
+        md_path=args.md_path,
+    )
+
+
+def cmd_upload(args) -> int:
+    from publish.payload import latest_run, load_run
+
+    run_dir = Path(args.run_dir) if args.run_dir else latest_run()
+    if args.run_dir and not run_dir.exists():
+        run_dir = config.ROOT / args.run_dir
+    title, tags, payload = load_run(run_dir)
+    console.print(f"올릴 결과물: [white]{run_dir}[/white]")
+    console.print(f"  제목: {title or '(제목 없음)'}")
+    console.print(f"  블록: {len(payload)}개")
+    return _upload_to_naver(
+        title, tags, payload, run_dir=run_dir, debug=args.debug, md_path=args.md_path,
+    )
+
+
+def _upload_to_naver(title: str, tags: list[str], payload, *, run_dir, debug: bool, md_path: str = "") -> int:
+    from publish.naver_blog import NaverBlogPublisher
+
+    reviewed = _review_before_upload(run_dir, title, tags, payload, md_path=md_path)
+    if reviewed is None:
+        console.print(f"중단했습니다. 다시 올리려면: python main.py upload --from {run_dir}")
+        return 0
+    title, tags, payload = reviewed
 
     naver_cfg = config.load_naver_config()
     naver_cfg.validate()
     mode = "임시저장" if naver_cfg.post_mode == "draft" else "즉시 발행"
-    if _ask(f"\n네이버 블로그에 {mode} 할까요? (y/n)", ("y", "n")) != "y":
-        console.print("중단했습니다. 원고는 저장되어 있습니다.")
+    if _ask(f"\n이 내용으로 네이버 블로그에 {mode} 할까요? (y/n)", ("y", "n")) != "y":
+        console.print(f"중단했습니다. 다시 올리려면: python main.py upload --from {run_dir}")
         return 0
 
-    from publish.naver_blog import NaverBlogPublisher, PostBlock
-
-    payload = [PostBlock(kind=op.kind, value=op.value) for op in result.ops]
-    with NaverBlogPublisher(naver_cfg, debug=args.debug) as publisher:
-        console.print("[cyan]›[/cyan] 네이버 로그인 중")
-        publisher.ensure_login()
-        console.print("[cyan]›[/cyan] 에디터에 내용 입력 중")
-        message = publisher.publish(result.draft.article.title, payload, result.draft.article.tags)
+    try:
+        with NaverBlogPublisher(naver_cfg, debug=debug) as publisher:
+            console.print("[cyan]›[/cyan] 네이버 로그인 중")
+            publisher.ensure_login()
+            console.print("[cyan]›[/cyan] 로그인 확인됨. 에디터에 내용 입력 중")
+            message = publisher.publish(title, payload, tags)
+    except NaverBlogError:
+        console.print(f"\n[yellow]원고는 그대로 있습니다.[/yellow] 다시 올리려면:")
+        console.print(f"  python main.py upload --from {run_dir}")
+        raise
 
     console.print(f"\n[bold green]{message}[/bold green]")
     return 0
 
 
-def _ask_page_url(buy_url: str) -> str:
+def _review_before_upload(run_dir, title: str, tags: list[str], payload, *, md_path: str):
+    """HTML 을 보여 주고, 제안 마크다운으로 article 을 다시 만든 뒤 올린다."""
+    from publish.review import ensure_suggestions, rebuild_from_notes
+
+    notes_file = ensure_suggestions(run_dir)
+    html_path = run_dir / "article.html"
+    webbrowser.open(html_path.as_uri())
+
+    if md_path:
+        chosen = _resolve_md(md_path)
+        title, tags, payload = _rebuild_article(run_dir, chosen, title, tags, payload)
+        webbrowser.open(html_path.as_uri())
+        return title, tags, payload
+
+    stamp = notes_file.stat().st_mtime
+    console.print()
+    console.print(Panel(
+        f"[bold]HTML 미리보기[/bold]  {html_path}\n"
+        f"[bold]수정 제안[/bold]  {notes_file}\n\n"
+        "브라우저에서 글을 확인한 뒤, 고칠 점만 suggestions.md 에 적으세요.\n"
+        "Copilot 과 확인한 제안이어도 됩니다. 완성 원고를 넣을 필요는 없습니다.\n"
+        "저장하면 그 제안으로 article 을 다시 작성합니다.\n\n"
+        "[white]엔터[/white]  이 폴더의 suggestions.md 로 다시 작성\n"
+        "[white]경로[/white]  다른 제안 md 로 다시 작성\n"
+        "[white]s[/white]     제안 없이 지금 article 로 진행\n"
+        "[white]n[/white]     업로드 취소",
+        title="업로드 전 검토", title_align="left", border_style="cyan",
+    ))
+
+    while True:
+        try:
+            answer = input("> ").strip()
+        except EOFError:
+            return title, tags, payload
+        if answer.lower() == "n":
+            return None
+        if answer.lower() == "s":
+            return title, tags, payload
+        if not answer:
+            if notes_file.stat().st_mtime <= stamp:
+                console.print("[yellow]suggestions.md 에 제안이 아직 없습니다. 지금 article 로 진행합니다.[/yellow]")
+                return title, tags, payload
+            chosen = notes_file
+        else:
+            chosen = _resolve_md(answer)
+            if chosen is None:
+                console.print("[yellow]그 경로에 md 파일이 없습니다. 다시 넣거나 s / n 을 입력하세요.[/yellow]")
+                continue
+        title, tags, payload = _rebuild_article(run_dir, chosen, title, tags, payload)
+        webbrowser.open(html_path.as_uri())
+        return title, tags, payload
+
+
+def _rebuild_article(run_dir, notes_path: Path, title: str, tags: list[str], payload):
+    from publish.review import rebuild_from_notes
+
+    title, tags, payload = rebuild_from_notes(
+        run_dir,
+        notes_path,
+        title,
+        tags,
+        payload,
+        report=lambda msg: console.print(f"[cyan]›[/cyan] {msg}"),
+    )
+    console.print(Panel(
+        f"[white]{notes_path}[/white] 제안으로 article 을 다시 만들었습니다.\n"
+        f"제목: {title or '(제목 없음)'}  ·  블록 {len(payload)}개\n"
+        "미리보기를 다시 열었습니다. 맞으면 다음에서 업로드를 진행하세요.",
+        title="원고 재작성", title_align="left", border_style="green",
+    ))
+    return title, tags, payload
+
+
+def _resolve_md(value: str) -> Path | None:
+    chosen = Path(value.strip().strip('"'))
+    if not chosen.exists():
+        chosen = config.ROOT / chosen
+    return chosen if chosen.exists() else None
+
+
+def _match_page_url(buy_url: str, page_urls: list[str]) -> str:
+    """--page-url 이 하나이고 상품도 하나일 때만 그대로 쓴다."""
+    if len(page_urls) == 1:
+        return page_urls[0]
+    return ""
+
+
+def _ask_page_url(buy_url: str, *, index: int = 0, total: int = 0) -> str:
     """내용을 긁어올 실제 상품 페이지를 물어본다.
 
     브랜드 커넥트 제휴 링크는 중간 페이지를 거쳐서 상품 내용이 제대로 안 잡히는
     경우가 있다. 판매 페이지 주소를 직접 받으면 그 문제가 사라진다.
     """
+    title = "실제 상품 페이지"
+    if total:
+        title = f"실제 상품 페이지 ({index}/{total})"
     console.print()
     console.print(Panel(
         f"[dim]구매 링크[/dim]  {buy_url}\n"
@@ -188,7 +366,7 @@ def _ask_page_url(buy_url: str) -> str:
         "내용과 이미지를 긁어올 [bold]실제 상품 판매 페이지[/bold] 주소를 알려주세요.\n"
         "[dim]예: https://brand.naver.com/finevu/products/13030260544[/dim]\n"
         "[dim]모르면 그냥 엔터. 구매 링크를 따라가서 긁습니다.[/dim]",
-        title="실제 상품 페이지", title_align="left", border_style="cyan",
+        title=title, title_align="left", border_style="cyan",
     ))
 
     while True:
@@ -207,7 +385,7 @@ def _choose_focus(options: list[FocusPoint]) -> FocusChoice:
     """상세페이지에서 뽑은 상품의 포인트를 보여주고 하나를 고르게 한다."""
     console.print()
     console.print(Panel(
-        "상세페이지를 확인해 이 상품에서 집중할 만한 점을 정리했습니다.\n"
+        "상세페이지를 확인해 이 글에서 집중할 만한 점을 정리했습니다.\n"
         "하나를 고르면 글 전체가 그 점을 중심으로 쓰입니다.",
         title="집중 포인트 선택", border_style="cyan",
     ))
@@ -276,6 +454,13 @@ def _show_report(result: PipelineResult) -> None:
 
     console.print()
     console.print(Panel(f"[bold]{article.title}[/bold]", border_style="green"))
+    if result.products and len(result.products) > 1:
+        names = "\n".join(f"· {p.title or p.url}" for p in result.products)
+        theme = result.roundup.theme if result.roundup else ""
+        console.print(Panel(
+            (f"[cyan]{theme}[/cyan]\n" if theme else "") + names,
+            title="묶어 소개한 상품", title_align="left", border_style="cyan",
+        ))
     if result.focus:
         console.print(Panel(f"{result.focus.title}\n[dim]{result.focus.angle}[/dim]",
                             title="집중 포인트", title_align="left", border_style="cyan"))

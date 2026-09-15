@@ -222,7 +222,7 @@ def load_post_config() -> PostConfig:
     return PostConfig(
         disclosure=_get(
             "DISCLOSURE_TEXT",
-            "본 포스팅은 네이버 브랜드커넥트를 통해 해당 업체로부터 원고료를 지원받아 작성되었습니다.",
+            "이 글에는 쇼핑 커넥트 상품이 포함되어 있으며, 상품 판매 시 크리에이터는 수수료를 받습니다.",
         ),
         persona=_get("BLOG_PERSONA", "친근하고 솔직한 리뷰어 말투"),
     )

@@ -77,31 +77,25 @@ def collect(url: str, *, max_detail: int = 12) -> tuple[list[ImageAsset], list[I
     og_images: list[str] = []
 
     try:
+        from scrape.browser import new_context
+        from scrape import naver_state
+
         with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=True,
-                args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
-            )
-            context = browser.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-                ),
-                locale="ko-KR",
-                viewport={"width": 1440, "height": 950},
-            )
-            context.add_init_script(
-                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
-            )
+            browser, context = new_context(p)
             page = context.new_page()
             page.goto(url, wait_until="domcontentloaded", timeout=60_000)
             page.wait_for_timeout(3000)
+
+            state = naver_state.read_from_page(page)
+            if state.get("representativeImageUrl"):
+                og_images.append(str(state["representativeImageUrl"]))
+            og_images.extend(str(u) for u in (state.get("optionalImageUrls") or []) if u)
 
             _open_detail_tab(page)
             _scroll_to_bottom(page)
 
             raw = page.evaluate(_COLLECT_JS) or []
-            og_images = page.evaluate(
+            og_images += page.evaluate(
                 "() => Array.from(document.querySelectorAll('meta[property=\"og:image\"]'))"
                 ".map(m => m.content).filter(Boolean)"
             ) or []

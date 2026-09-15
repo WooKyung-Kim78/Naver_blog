@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Callable
 
 import config
-from ai import analyst, critic, focus as focus_mod, humanizer, reviser, seo as seo_mod, writer
+from ai import analyst, critic, focus as focus_mod, humanizer, reviser, roundup as roundup_mod, seo as seo_mod, writer
 from ai.client import MyGenAssistClient
 from core.models import (
     KIND_CTA,
@@ -40,6 +40,7 @@ from core.models import (
     ImageAsset,
     Product,
     ProductBrief,
+    RoundupBrief,
     SeoPlan,
 )
 from media.evaluator import ImageProcessor
@@ -48,6 +49,8 @@ from media.planner import ImagePlanner
 from media.stock import StockImageFetcher
 from render import html as html_render
 from render import naver_blocks
+from core.article_io import save_article
+from publish.review import SUGGESTIONS_FILE, SUGGESTIONS_TEMPLATE
 from scrape import product as product_scraper
 
 Reporter = Callable[[str], None]
@@ -59,6 +62,9 @@ MAX_FOCUS_ROUNDS = 4
 #: 네이버 차단은 대개 잠깐이다. 몇 번 쉬었다 다시 해보고 나서 포기한다.
 SCRAPE_ROUNDS = 3
 SCRAPE_COOLDOWN = 45
+
+#: 한 글에 묶을 수 있는 상품 수. 다섯 개부터는 글이 쇼핑 목록이 된다.
+MAX_PRODUCTS = 4
 
 
 @dataclass
@@ -73,6 +79,8 @@ class PipelineResult:
     ops: list[naver_blocks.Op]
     run_dir: Path
     attempts: list[Draft]
+    products: list[Product] | None = None
+    roundup: RoundupBrief | None = None
 
 
 class Pipeline:
@@ -131,7 +139,77 @@ class Pipeline:
         self._save(run_dir, product, brief, focus, options, seo, draft, attempts)
 
         return PipelineResult(
-            product, brief, focus, options, seo, draft, images, ops, run_dir, attempts
+            product, brief, focus, options, seo, draft, images, ops, run_dir, attempts,
+            products=[product],
+        )
+
+    def run_roundup(
+        self,
+        items: list[tuple[str, str, str]],
+        *,
+        collect_images: bool = True,
+    ) -> PipelineResult:
+        """여러 상품을 모아 공통점을 찾고 한 글로 쓴다.
+
+        items 는 (구매 링크, 판매 페이지, 수동 설명) 튜플. 개수는 2~4.
+        """
+        if not 2 <= len(items) <= MAX_PRODUCTS:
+            raise RuntimeError(f"묶어 쓸 상품은 2~{MAX_PRODUCTS}개입니다. 지금은 {len(items)}개입니다.")
+
+        products: list[Product] = []
+        for i, (buy_url, page_url, desc) in enumerate(items, 1):
+            self.report(f"[{i}/{len(items)}] 상품 수집")
+            products.append(self._collect_product(buy_url, page_url or buy_url, desc, collect_images))
+
+        stamp = f"{datetime.now():%Y%m%d_%H%M%S}"
+        run_dir = config.OUTPUT_DIR / f"{stamp}_{_slug(products[0].title)}_외{len(products)-1}"
+
+        available: list[ImageAsset] = []
+        for i, product in enumerate(products):
+            batch = self._prepare_images(product, run_dir, owner=str(i))
+            available.extend(batch)
+
+        briefs: list[ProductBrief] = []
+        for i, product in enumerate(products):
+            self.report(f"[{i+1}/{len(products)}] 상품 분석: {product.title or product.url}")
+            briefs.append(analyst.analyze(self.client, product))
+
+        self.report("조합의 공통점과 같이 쓰는 이유를 정리하는 중")
+        combo = roundup_mod.analyze(self.client, products, briefs)
+        self.report(f"  테마: {combo.theme or '(없음)'} / 공통점 {len(combo.commonalities)}개")
+
+        focus, options = self._pick_roundup_focus(products, briefs, combo, available)
+
+        self.report("SEO 키워드 전략 수립 중 (웹 검색 포함)")
+        lead_brief = briefs[0]
+        if combo.theme:
+            lead_brief.category = combo.theme
+            lead_brief.one_liner = combo.one_liner or lead_brief.one_liner
+        seo = seo_mod.plan(
+            self.client,
+            products[0],
+            lead_brief,
+            focus=focus,
+            extra_titles=[p.title for p in products[1:]],
+            theme=combo.theme,
+        )
+        self.report(f"  메인 키워드: {seo.main_keyword} ({seo.search_type}, 경쟁도 {seo.competition})")
+
+        draft, attempts = self._write_roundup_until_good(products, briefs, combo, seo, focus)
+
+        images = self._place_roundup_images(products, lead_brief, seo, draft.article, run_dir, available)
+        run_dir = _rename_run_dir(
+            run_dir, config.OUTPUT_DIR / f"{stamp}_{_slug(draft.article.title)}",
+            draft.article, images,
+        )
+
+        ops = naver_blocks.render(draft.article)
+        self._save(run_dir, products[0], lead_brief, focus, options, seo, draft, attempts,
+                   products=products, combo=combo)
+
+        return PipelineResult(
+            products[0], lead_brief, focus, options, seo, draft, images, ops, run_dir, attempts,
+            products=products, roundup=combo,
         )
 
     # -------------------------------------------------------------- 각 단계
@@ -208,13 +286,19 @@ class Pipeline:
             "  계속 막히면 --desc 로 상품 설명을 직접 넣어 진행할 수 있습니다."
         )
 
-    def _prepare_images(self, product: Product, run_dir: Path) -> list[ImageAsset]:
+    def _prepare_images(
+        self, product: Product, run_dir: Path, *, owner: str = ""
+    ) -> list[ImageAsset]:
         """상품 이미지를 미리 내려받아 평가·중복제거까지 마친다.
 
         집중 포인트를 고를 때 AI 에게 상세 이미지를 보여줘야 해서 집필보다 먼저 돈다.
         """
-        candidates = [ImageAsset(source="thumbnail", url=u) for u in product.thumbnail_urls[:6]]
-        candidates += [ImageAsset(source="detail", url=u) for u in product.detail_image_urls[:12]]
+        candidates = [
+            ImageAsset(source="thumbnail", url=u, owner=owner) for u in product.thumbnail_urls[:6]
+        ]
+        candidates += [
+            ImageAsset(source="detail", url=u, owner=owner) for u in product.detail_image_urls[:12]
+        ]
         if not candidates:
             return []
 
@@ -222,7 +306,8 @@ class Pipeline:
         # 네이버 이미지 CDN 은 Referer 를 본다. 구매 링크가 아니라 이미지를 찾은
         # 페이지 주소를 보내야 한다.
         referer = product.resolved_url or product.page_url or product.url
-        available = self._processor.prepare(candidates, run_dir / "images" / "product", referer=referer)
+        dest = run_dir / "images" / ("product" + (f"_{owner}" if owner else ""))
+        available = self._processor.prepare(candidates, dest, referer=referer)
 
         by_source: dict[str, int] = {}
         for asset in available:
@@ -273,6 +358,58 @@ class Pipeline:
         self.report("  재제안 횟수를 다 썼습니다. 집중 포인트 없이 진행합니다.")
         return None, []
 
+    def _pick_roundup_focus(
+        self,
+        products: list[Product],
+        briefs: list[ProductBrief],
+        combo: RoundupBrief,
+        available: list[ImageAsset],
+    ) -> tuple[FocusPoint | None, list[FocusPoint]]:
+        # 상품마다 점수 높은 상세 이미지를 하나씩만 보여 토큰을 아낀다.
+        paths: list[Path] = []
+        owners = {a.owner for a in available}
+        for owner in sorted(owners, key=lambda x: int(x) if str(x).isdigit() else 99):
+            details = sorted(
+                (a for a in available if a.owner == owner and a.source == "detail" and a.path),
+                key=lambda a: a.score,
+                reverse=True,
+            )
+            if details:
+                paths.append(details[0].path)
+            if len(paths) >= roundup_mod.MAX_VISION_IMAGES:
+                break
+
+        if paths:
+            self.report(f"상품 이미지 {len(paths)}장을 AI 가 직접 읽는 중")
+        else:
+            self.report("상세 이미지가 없어 텍스트만으로 조합의 축을 뽑습니다")
+
+        rejected: list[str] = []
+        hint = ""
+        for round_no in range(1, MAX_FOCUS_ROUNDS + 1):
+            if round_no > 1:
+                self.report(f"조합의 축을 다시 뽑는 중 ({round_no}/{MAX_FOCUS_ROUNDS})")
+            try:
+                options = roundup_mod.propose_themes(
+                    self.client, products, briefs, combo, paths, avoid=rejected, hint=hint
+                )
+            except Exception as exc:
+                self.report(f"  집중 포인트 제안 실패({exc}). 테마만으로 진행합니다.")
+                return None, []
+
+            choice = self.choose(options)
+            if not choice.retry:
+                if choice.point:
+                    self.report(f"  선택된 공통점: {choice.point.title}")
+                else:
+                    self.report("  집중 포인트 없이 진행합니다.")
+                return choice.point, options
+            rejected += [o.title for o in options]
+            hint = choice.hint or hint
+
+        self.report("  재제안 횟수를 다 썼습니다. 테마만으로 진행합니다.")
+        return None, []
+
     def _write_until_good(
         self, product: Product, brief: ProductBrief, seo: SeoPlan, focus: FocusPoint | None
     ) -> tuple[Draft, list[Draft]]:
@@ -313,6 +450,59 @@ class Pipeline:
                 best = draft
             else:
                 # 수정이 오히려 나빠졌으면 그 결과를 버리고 최고 원고에서 다시 시도한다.
+                self.report(f"  직전보다 낮아 이전 원고({best.quality.total}점)를 유지합니다.")
+                article = best.article
+
+            if quality.total >= self.quality_cfg.pass_mark:
+                break
+            if attempt < self.quality_cfg.max_attempts:
+                self.report(f"  기준 {self.quality_cfg.pass_mark}점 미달. 지적 사항을 고쳐 다시 평가합니다.")
+
+        assert best is not None
+        return best, attempts
+
+    def _write_roundup_until_good(
+        self,
+        products: list[Product],
+        briefs: list[ProductBrief],
+        combo: RoundupBrief,
+        seo: SeoPlan,
+        focus: FocusPoint | None,
+    ) -> tuple[Draft, list[Draft]]:
+        attempts: list[Draft] = []
+        best: Draft | None = None
+        article: Article | None = None
+        lead = briefs[0]
+
+        for attempt in range(1, self.quality_cfg.max_attempts + 1):
+            if article is None:
+                self.report(f"묶음 원고 집필 중 (시도 {attempt}/{self.quality_cfg.max_attempts})")
+                article = roundup_mod.write(
+                    self.client, products, briefs, combo, seo,
+                    self.post_cfg.persona, self.post_cfg.disclosure, focus=focus,
+                )
+            else:
+                self.report(f"지적 사항 수정 중 (시도 {attempt}/{self.quality_cfg.max_attempts})")
+                article = reviser.revise(
+                    self.client, article, seo, best.quality, best.seo_score, self.post_cfg.persona,
+                )
+
+            report = humanizer.measure(article.body_text())
+            if self.quality_cfg.humanize:
+                self.report("  AI 문체 계측 후 자연스럽게 다듬는 중")
+                article, report = humanizer.humanize(self.client, article, self.post_cfg.persona, seo)
+
+            seo_score = seo_mod.score(article, seo)
+            self.report("  품질 평가 중")
+            quality = critic.evaluate(self.client, article, lead, seo, seo_score)
+            draft = Draft(article=article, quality=quality, seo_score=seo_score,
+                          humanness=report, attempt=attempt)
+            attempts.append(draft)
+            self.report(f"  총점 {quality.total}/100 (SEO {seo_score.total}, 본문 {article.char_count():,}자)")
+
+            if best is None or quality.total > best.quality.total:
+                best = draft
+            else:
                 self.report(f"  직전보다 낮아 이전 원고({best.quality.total}점)를 유지합니다.")
                 article = best.article
 
@@ -371,16 +561,116 @@ class Pipeline:
 
         return placed
 
+    def _place_roundup_images(
+        self,
+        products: list[Product],
+        brief: ProductBrief,
+        seo: SeoPlan,
+        article: Article,
+        run_dir: Path,
+        available: list[ImageAsset],
+    ) -> dict[str, ImageAsset]:
+        """상품별 슬롯(item0, cta1 ...)에는 그 상품 이미지를 우선 넣는다."""
+        slots = article.image_slots()
+        if not slots:
+            return {}
+
+        self.report(f"이미지 배치 중 (슬롯 {len(slots)}개, 상품 {len(products)}개)")
+        image_dir = run_dir / "images"
+
+        stock = None
+        try:
+            self.img_cfg.validate()
+            stock = StockImageFetcher(self.img_cfg)
+        except config.ConfigError:
+            self.report("  스톡 이미지 키가 없어 건너뜁니다.")
+
+        planner = ImagePlanner(
+            stock=stock, generator=ImageGenerator(self.gen_cfg),
+            processor=self._processor, image_dir=image_dir,
+        )
+
+        used: set[int] = set()
+        placed: dict[str, ImageAsset] = {}
+
+        def take(slot: str, pool: list[ImageAsset], prefer: tuple[str, ...]) -> ImageAsset | None:
+            for source in prefer:
+                candidates = [
+                    a for a in pool
+                    if a.source == source and a.path and (a.phash is None or a.phash not in used)
+                ]
+                if candidates:
+                    return max(candidates, key=lambda a: a.score)
+            return None
+
+        shared = [s for s in slots if not s.startswith(("item", "cta"))]
+        owned = [s for s in slots if s.startswith(("item", "cta"))]
+
+        for slot in owned:
+            owner = slot[4:] if slot.startswith("item") else slot[3:]
+            pool = [a for a in available if a.owner == owner]
+            asset = take(slot, pool, ("thumbnail", "detail"))
+            if asset:
+                asset.slot = slot
+                if asset.phash is not None:
+                    used.add(asset.phash)
+                placed[slot] = asset
+
+        leftovers = [a for a in available if a.phash is None or a.phash not in used]
+        shared_placed = planner.assign(shared, leftovers, brief, stock_query=_stock_query(brief, seo))
+        placed.update(shared_placed)
+
+        for block in article.blocks:
+            if block.kind in (KIND_IMAGE, KIND_CTA) and block.slot in placed:
+                block.image = placed[block.slot]
+
+        article.blocks = [
+            b for b in article.blocks if not (b.kind == KIND_IMAGE and b.image is None)
+        ]
+
+        for slot, asset in placed.items():
+            self.report(f"  {slot:<12} <- {asset.source} ({asset.width}x{asset.height}, 점수 {asset.score})")
+        return placed
+
     def _save(
-        self, run_dir: Path, product, brief, focus, options, seo, draft: Draft, attempts: list[Draft]
+        self,
+        run_dir: Path,
+        product,
+        brief,
+        focus,
+        options,
+        seo,
+        draft: Draft,
+        attempts: list[Draft],
+        *,
+        products: list[Product] | None = None,
+        combo: RoundupBrief | None = None,
     ) -> None:
         run_dir.mkdir(parents=True, exist_ok=True)
 
         (run_dir / "article.html").write_text(
             html_render.render(draft.article, seo), encoding="utf-8"
         )
+        save_article(run_dir, draft.article)
+        suggestions = run_dir / SUGGESTIONS_FILE
+        if not suggestions.exists():
+            suggestions.write_text(SUGGESTIONS_TEMPLATE, encoding="utf-8")
+        ops = naver_blocks.render(draft.article)
         (run_dir / "naver.txt").write_text(
-            "\n\n".join(f"[{op.kind}] {op.value}" for op in naver_blocks.render(draft.article)),
+            "\n\n".join(f"[{op.kind}] {op.value}" for op in ops),
+            encoding="utf-8",
+        )
+        # 업로드만 다시 할 때 원고 생성을 건너뛰기 위한 묶음.
+        (run_dir / "upload.json").write_text(
+            json.dumps(
+                {
+                    "title": draft.article.title,
+                    "tags": draft.article.tags,
+                    "ops": [{"kind": op.kind, "value": op.value} for op in ops],
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
             encoding="utf-8",
         )
         (run_dir / "report.json").write_text(
@@ -393,6 +683,18 @@ class Pipeline:
                         "title": product.title,
                         "price": product.price,
                     },
+                    "products": [
+                        {"buy_url": p.url, "page_url": p.page_url, "title": p.title, "price": p.price}
+                        for p in (products or [product])
+                    ],
+                    "roundup": (
+                        {
+                            **{k: v for k, v in combo.__dict__.items() if k != "faqs"},
+                            "faqs": [f.__dict__ for f in combo.faqs],
+                        }
+                        if combo
+                        else None
+                    ),
                     "brief": {
                         "category": brief.category,
                         "features": [f.__dict__ for f in brief.features],
@@ -425,9 +727,9 @@ MIN_PRODUCT_SIGNALS = 2
 def _require_product_signal(product: Product) -> None:
     signals = {
         "가격": bool(product.price),
-        "스펙표": len(product.specs) >= 3,
-        "상세 이미지": len(product.detail_image_urls) >= 3,
-        "본문": len(product.body_text) >= 1200,
+        "상품명": bool(product.title) and len(product.title) >= 6,
+        "상품 이미지": (len(product.thumbnail_urls) + len(product.detail_image_urls)) >= 1,
+        "설명": len(product.body_text) >= 150,
     }
     if sum(signals.values()) >= MIN_PRODUCT_SIGNALS:
         return
