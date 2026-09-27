@@ -4,7 +4,7 @@
 결정론적으로 조립한다. 서식까지 AI 에게 맡기면 실행할 때마다 결과가 달라진다.
 
 구조: 제목 - 도입부 - 문제제기 - 상품소개 - 주요특징 - 실사용 시나리오 -
-      장점 - 아쉬운 점 - FAQ - 총평 - CTA
+      장점 - 아쉬운 점 - 한눈에 보기 - 총평 - CTA
 """
 
 from __future__ import annotations
@@ -18,7 +18,6 @@ from core.models import (
     KIND_CHECKLIST,
     KIND_CTA,
     KIND_DIVIDER,
-    KIND_FAQ,
     KIND_HEADING,
     KIND_IMAGE,
     KIND_LINK,
@@ -58,9 +57,9 @@ _BACK_SCHEMA = """{
   "cons_lead": "아쉬운 점 도입 한 문장. 솔직하게 인정하는 톤",
   "cons_items": ["아쉬운 점", "3~4개"],
   "cons_balance": "그럼에도 감수할 만한 이유 한두 문장",
-  "faq_lead": "FAQ 도입 한 문장",
+  "summary_lead": "한눈에 보기 도입 한 문장. 아래 그림에 무엇이 정리돼 있는지 알려준다",
   "verdict": "총평. 2문단. 누구에게 맞고 누구에겐 아닌지 분명히",
-  "summary_box": ["3줄 요약", "각 줄 30자 내외", "3개"],
+  "summary_box": ["3줄 요약. 글 끝 인포그래픽에도 그대로 들어간다", "각 줄 35자 이내", "3개"],
   "mid_ctas": ["본문 중간에 넣을 링크 안내 문구", "2개. 각 30자 내외. 서로 다른 표현. URL 은 쓰지 마라"],
   "cta": "구매 페이지로 유도하는 마지막 문장. 강매하지 않고 담백하게. URL 은 쓰지 마라",
   "tags": ["태그", "# 없이 8~12개"]
@@ -120,6 +119,8 @@ def write(
 - scenarios 는 3개. brief 의 scenarios 를 근거로 실제 써 본 것처럼 묘사한다.
 - cons_items 는 반드시 채운다. 단점 없는 리뷰는 광고로 읽혀 신뢰를 잃는다.
 - verdict 에서 추천 대상과 비추천 대상을 모두 밝힌다.
+- summary_box 는 글 끝의 인포그래픽에 한 줄씩 그대로 들어간다. 길면 그림에서 두 줄로
+  넘어가므로 35자를 넘기지 마라.
 - 아래 키워드를 이 구간에 반드시 한 번씩 등장시킨다. 문장에 녹여 쓰고 나열하지 않는다.
   {', '.join(seo.sub_keywords[3:]) or '(없음)'}
 - 메인 키워드 '{seo.main_keyword}' 는 이 구간에서 정확히 {_back_quota(seo)}번만 쓴다.
@@ -286,12 +287,10 @@ def _assemble(
         add(KIND_CALLOUT, text="\n".join(f"· {c}" for c in cons), style="warn")
     _add_paragraphs(blocks, back.get("cons_balance"))
 
-    # FAQ
-    add(KIND_HEADING, text=h2("FAQ", "자주 묻는 질문"), level=2)
+    # 한눈에 보기. 글 전체를 요약한 인포그래픽 한 장으로 대신한다.
+    add(KIND_HEADING, text=h2("한눈에", "한눈에 보기"), level=2)
+    _add_paragraphs(blocks, back.get("summary_lead"))
     add(KIND_IMAGE, slot=SLOT_INFOGRAPHIC)
-    _add_paragraphs(blocks, back.get("faq_lead"))
-    if brief.faqs:
-        add(KIND_FAQ, qa=brief.faqs)
 
     # 총평
     add(KIND_HEADING, text=h2("총평", "총평"), level=2)

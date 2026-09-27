@@ -2,10 +2,12 @@
 
 사용법:
     python main.py doctor                      설정과 API 연결 상태 점검
-    python main.py post --url <상품 URL>        생성 후 네이버에 업로드
+    python main.py post --url <상품 URL>        생성 후 네이버와 티스토리에 업로드
     python main.py post --url <URL> --dry-run   업로드 없이 원고와 이미지만 생성
-    python main.py upload                      이미 만든 결과물을 네이버에 임시저장/발행
+    python main.py upload                      이미 만든 결과물을 네이버·티스토리에 올리기
     python main.py upload --from output/폴더    특정 결과물만 다시 올리기
+    python main.py upload --tistory-only        티스토리에만 다시 올리기
+    python main.py tistory-login                티스토리(카카오) 로그인을 한 번 저장
     python main.py upload --md 제안.md          수정 제안 마크다운으로 article 을 다시 쓴 뒤 올리기
 """
 
@@ -26,6 +28,7 @@ from core.models import KIND_CTA, KIND_HEADING, KIND_IMAGE, KIND_LINK, FocusChoi
 from pipeline import MAX_PRODUCTS, Pipeline, PipelineResult
 from scrape.product import ProductUnavailable
 from publish.naver_blog import NaverBlogError
+from publish.tistory import TistoryError
 
 console = Console()
 
@@ -46,26 +49,37 @@ def main() -> int:
         help="내용을 긁어올 실제 상품 페이지. --url 과 같은 순서로. 생략하면 물어본다",
     )
     post.add_argument("--desc", default="", help="상품 설명 직접 입력(사이트가 크롤링을 막을 때)")
+    post.add_argument(
+        "--browser", action="store_true",
+        help="수집이 막히면 기다렸다 재시도하지 않고 바로 브라우저 창을 띄운다 "
+             "(상세 이미지가 0개면 이 옵션 없이도 창을 띄운다)",
+    )
     post.add_argument("--dry-run", action="store_true", help="네이버에 올리지 않고 원고만 생성")
     post.add_argument("--no-images", action="store_true", help="상세페이지 이미지 수집 건너뛰기(빠름)")
     post.add_argument("--open", action="store_true", help="완성된 HTML 미리보기를 브라우저로 열기")
     post.add_argument("--md", dest="md_path", default="", help="수정 제안 마크다운. 있으면 그 제안으로 article 을 다시 쓴 뒤 올린다")
     post.add_argument("--debug", action="store_true", help="브라우저 스크린샷 저장")
     post.add_argument("--auto-focus", action="store_true", help="집중 포인트를 묻지 않고 1안으로 진행")
+    _add_destination_flags(post)
 
-    upload = sub.add_parser("upload", help="이미 만든 결과물을 네이버에 올리기 (원고 생성 생략)")
+    upload = sub.add_parser("upload", help="이미 만든 결과물을 네이버와 티스토리에 올리기 (원고 생성 생략)")
     upload.add_argument(
         "--from", dest="run_dir", default="",
         help="결과 폴더. 생략하면 output/ 에서 가장 최근 것을 쓴다",
     )
     upload.add_argument("--md", dest="md_path", default="", help="수정 제안 마크다운. 있으면 그 제안으로 article 을 다시 쓴 뒤 올린다")
     upload.add_argument("--debug", action="store_true", help="브라우저 스크린샷 저장")
+    _add_destination_flags(upload)
+
+    sub.add_parser("tistory-login", help="티스토리 카카오 로그인을 한 번 저장")
 
     args = parser.parse_args()
 
     try:
         if args.command == "doctor":
             return cmd_doctor()
+        if args.command == "tistory-login":
+            return cmd_tistory_login()
         if args.command == "upload":
             return cmd_upload(args)
         return cmd_post(args)
@@ -81,6 +95,10 @@ def main() -> int:
     except NaverBlogError as exc:
         console.print()
         console.print(Panel(str(exc), title="네이버 업로드 실패", title_align="left", border_style="red"))
+        return 1
+    except TistoryError as exc:
+        console.print()
+        console.print(Panel(str(exc), title="티스토리 업로드 실패", title_align="left", border_style="red"))
         return 1
     except ProductUnavailable as exc:
         console.print()
@@ -147,6 +165,19 @@ def cmd_doctor() -> int:
     except config.ConfigError as exc:
         table.add_row("네이버 설정", f"[red]{exc}[/red]")
 
+    tistory_cfg = config.load_tistory_config()
+    if not tistory_cfg.blog_name:
+        table.add_row("티스토리", "[yellow]미설정[/yellow] TISTORY_BLOG_NAME")
+    else:
+        try:
+            tistory_cfg.validate()
+            session = "세션 있음" if config.TISTORY_SESSION_FILE.exists() else "로그인 필요 (python main.py tistory-login)"
+            vis = "공개" if tistory_cfg.wants_public() else "비공개"
+            cat = tistory_cfg.category or "기본 카테고리"
+            table.add_row("티스토리", f"[green]{tistory_cfg.blog_name}[/green] / {cat} / {vis} / {session}")
+        except config.ConfigError as exc:
+            table.add_row("티스토리", f"[red]{exc}[/red]")
+
     try:
         from playwright.sync_api import sync_playwright
 
@@ -167,6 +198,8 @@ def cmd_post(args) -> int:
     pipeline = Pipeline(
         report=lambda msg: console.print(f"  {msg}" if msg.startswith(" ") else f"[cyan]›[/cyan] {msg}"),
         choose=(lambda options: FocusChoice(point=options[0])) if args.auto_focus else _choose_focus,
+        handoff=_handoff,
+        handoff_on_block=args.browser,
     )
 
     urls = args.urls
@@ -200,20 +233,22 @@ def cmd_post(args) -> int:
     if args.dry_run:
         if args.open:
             webbrowser.open((result.run_dir / "article.html").as_uri())
-        console.print("\n[yellow]--dry-run 이므로 네이버에는 올리지 않았습니다.[/yellow]")
+        console.print("\n[yellow]--dry-run 이므로 네이버와 티스토리에는 올리지 않았습니다.[/yellow]")
         console.print(f"  고친 뒤 올리려면: python main.py upload --from {result.run_dir}")
         return 0
 
     from publish.naver_blog import PostBlock
 
-    payload = [PostBlock(kind=op.kind, value=op.value) for op in result.ops]
-    return _upload_to_naver(
+    payload = [PostBlock(kind=op.kind, value=op.value, query=op.query) for op in result.ops]
+    return _upload(
         result.draft.article.title,
         result.draft.article.tags,
         payload,
         run_dir=result.run_dir,
         debug=args.debug,
         md_path=args.md_path,
+        tistory_only=args.tistory_only,
+        no_tistory=args.no_tistory,
     )
 
 
@@ -227,40 +262,197 @@ def cmd_upload(args) -> int:
     console.print(f"올릴 결과물: [white]{run_dir}[/white]")
     console.print(f"  제목: {title or '(제목 없음)'}")
     console.print(f"  블록: {len(payload)}개")
-    return _upload_to_naver(
+    return _upload(
         title, tags, payload, run_dir=run_dir, debug=args.debug, md_path=args.md_path,
+        tistory_only=args.tistory_only, no_tistory=args.no_tistory,
     )
 
 
-def _upload_to_naver(title: str, tags: list[str], payload, *, run_dir, debug: bool, md_path: str = "") -> int:
-    from publish.naver_blog import NaverBlogPublisher
+def _add_destination_flags(parser) -> None:
+    parser.add_argument("--tistory-only", action="store_true", help="네이버는 건너뛰고 티스토리에만 올린다")
+    parser.add_argument("--no-tistory", action="store_true", help="티스토리에는 올리지 않는다")
 
+
+def cmd_tistory_login() -> int:
+    from publish.tistory import TistoryPublisher
+
+    tistory_cfg = config.load_tistory_config()
+    tistory_cfg.validate()
+    with TistoryPublisher(tistory_cfg, debug=False) as publisher:
+        console.print("[cyan]›[/cyan] 티스토리 로그인 확인")
+        publisher.ensure_login()
+    console.print("[bold green]티스토리 로그인 세션을 저장했습니다.[/bold green]")
+    console.print("  다음 업로드부터는 카카오 로그인을 다시 묻지 않습니다.")
+    return 0
+
+
+def _upload(
+    title: str,
+    tags: list[str],
+    payload,
+    *,
+    run_dir,
+    debug: bool,
+    md_path: str = "",
+    tistory_only: bool = False,
+    no_tistory: bool = False,
+) -> int:
     reviewed = _review_before_upload(run_dir, title, tags, payload, md_path=md_path)
     if reviewed is None:
         console.print(f"중단했습니다. 다시 올리려면: python main.py upload --from {run_dir}")
         return 0
     title, tags, payload = reviewed
 
-    naver_cfg = config.load_naver_config()
-    naver_cfg.validate()
-    mode = "임시저장" if naver_cfg.post_mode == "draft" else "즉시 발행"
-    if _ask(f"\n이 내용으로 네이버 블로그에 {mode} 할까요? (y/n)", ("y", "n")) != "y":
-        console.print(f"중단했습니다. 다시 올리려면: python main.py upload --from {run_dir}")
+    do_naver = not tistory_only
+    tistory_cfg = config.load_tistory_config()
+    do_tistory = not no_tistory and bool(tistory_cfg.blog_name)
+    if tistory_only and not tistory_cfg.blog_name:
+        raise config.ConfigError(
+            "TISTORY_BLOG_NAME 이 비어 있습니다. .env 에 블로그 이름(wkkim97)을 넣은 뒤 다시 실행하세요."
+        )
+    if tistory_only and no_tistory:
+        console.print("[yellow]--tistory-only 와 --no-tistory 를 같이 쓸 수 없습니다.[/yellow]")
+        return 1
+
+    if not _confirm_destinations(do_naver, do_tistory, tistory_cfg, run_dir):
         return 0
 
+    naver_message = ""
+    if do_naver:
+        naver_message = _publish_naver(title, tags, payload, run_dir=run_dir, debug=debug)
+        console.print(f"\n[bold green]{naver_message}[/bold green]")
+
+    if do_tistory:
+        naver_url = _ask_naver_url(run_dir, just_saved=do_naver)
+        if not naver_url:
+            console.print("\n[yellow]티스토리는 건너뛰었습니다.[/yellow]")
+            console.print(f"  나중에 올리려면: python main.py upload --from {run_dir} --tistory-only")
+            return 0
+        try:
+            tistory_message = _publish_tistory(title, tags, naver_url, run_dir=run_dir, debug=debug, cfg=tistory_cfg)
+        except TistoryError:
+            if naver_message:
+                console.print(f"\n[yellow]네이버에는 올라갔습니다.[/yellow] {naver_message}")
+                console.print(f"  티스토리만 다시 올리려면: python main.py upload --from {run_dir} --tistory-only")
+            raise
+        console.print(f"\n[bold green]{tistory_message}[/bold green]")
+    elif not no_tistory:
+        console.print(
+            "\n[yellow]티스토리는 건너뛰었습니다.[/yellow] "
+            ".env 의 TISTORY_BLOG_NAME 을 채우면 다음부터 같이 올라갑니다."
+        )
+    return 0
+
+
+def _confirm_destinations(do_naver: bool, do_tistory: bool, tistory_cfg, run_dir) -> bool:
+    lines = []
+    if do_naver:
+        naver_cfg = config.load_naver_config()
+        naver_cfg.validate()
+        mode = "임시저장" if naver_cfg.post_mode == "draft" else "즉시 발행"
+        lines.append(f"네이버 블로그  {mode}")
+    if do_tistory:
+        tistory_cfg.validate()
+        vis = "공개 발행" if tistory_cfg.wants_public() else "비공개 저장"
+        cat = tistory_cfg.category or "기본 카테고리"
+        lines.append(f"티스토리 {tistory_cfg.home} / {cat}  {vis}")
+        lines.append("티스토리에는 제목과 네이버 발행 글 링크, 태그만 올립니다.")
+        if not tistory_cfg.wants_public():
+            lines.append("비공개 글은 구글에 나오지 않습니다. 노출하려면 TISTORY_VISIBILITY=3 으로 바꾸세요.")
+    console.print()
+    if _ask("이 내용으로 올릴까요?\n  " + "\n  ".join(lines) + "\n(y/n)", ("y", "n")) != "y":
+        console.print(f"중단했습니다. 다시 올리려면: python main.py upload --from {run_dir}")
+        return False
+    return True
+
+
+def _publish_naver(title: str, tags: list[str], payload, *, run_dir, debug: bool) -> str:
+    from publish.naver_blog import NaverBlogPublisher
+
+    naver_cfg = config.load_naver_config()
+    naver_cfg.validate()
     try:
         with NaverBlogPublisher(naver_cfg, debug=debug) as publisher:
             console.print("[cyan]›[/cyan] 네이버 로그인 중")
             publisher.ensure_login()
             console.print("[cyan]›[/cyan] 로그인 확인됨. 에디터에 내용 입력 중")
-            message = publisher.publish(title, payload, tags)
+            return publisher.publish(title, payload, tags)
     except NaverBlogError:
         console.print(f"\n[yellow]원고는 그대로 있습니다.[/yellow] 다시 올리려면:")
         console.print(f"  python main.py upload --from {run_dir}")
         raise
 
-    console.print(f"\n[bold green]{message}[/bold green]")
-    return 0
+
+def _ask_naver_url(run_dir, *, just_saved: bool) -> str:
+    """네이버에서 직접 발행한 글 주소를 받는다. n 을 넣으면 빈 문자열을 돌려준다."""
+    saved_file = run_dir / "naver.url"
+    saved = saved_file.read_text(encoding="utf-8").strip() if saved_file.exists() else ""
+    console.print()
+    if just_saved:
+        console.print(Panel(
+            "네이버 블로그에서 임시저장한 글을 [bold]직접 발행[/bold]하세요.\n"
+            "발행이 완료될 때까지 기다립니다. 발행한 뒤 그 글의 주소를 여기에 넣으세요.\n"
+            "예) https://blog.naver.com/아이디/223456789012\n\n"
+            "[white]n[/white]  티스토리 건너뛰기",
+            title="네이버 발행 대기", title_align="left", border_style="cyan",
+        ))
+    else:
+        console.print("티스토리에 넣을 네이버 발행 글 주소를 입력하세요. (n: 건너뛰기)")
+    if saved:
+        console.print(f"  엔터만 누르면 지난번 주소를 씁니다: {saved}")
+
+    while True:
+        try:
+            answer = input("네이버 글 주소 > ").strip()
+        except EOFError:
+            return ""
+        if answer.lower() == "n":
+            return ""
+        if not answer and saved:
+            return saved
+        if _is_naver_post_url(answer):
+            saved_file.write_text(answer + "\n", encoding="utf-8")
+            return answer
+        console.print(
+            "[yellow]네이버 블로그 글 주소가 아닙니다.[/yellow] "
+            "발행된 글의 https://blog.naver.com/... 주소를 넣거나 n 을 입력하세요."
+        )
+
+
+def _is_naver_post_url(url: str) -> bool:
+    from urllib.parse import urlparse
+
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        return False
+    host = (parsed.hostname or "").lower()
+    if host not in ("blog.naver.com", "m.blog.naver.com", "naver.me"):
+        return False
+    # 임시저장 글쓰기 화면 주소는 발행 글이 아니다.
+    return "postwrite" not in url.lower() and "redirect=write" not in url.lower()
+
+
+def _publish_tistory(title, tags, naver_url: str, *, run_dir, debug: bool, cfg) -> str:
+    from publish.tistory import TistoryPublisher
+
+    cfg.validate()
+    vis = "공개 발행" if cfg.wants_public() else "비공개 저장"
+    try:
+        with TistoryPublisher(cfg, debug=debug) as publisher:
+            console.print(f"[cyan]›[/cyan] 티스토리 {vis} 중 ({cfg.category or '기본 카테고리'})")
+            url = publisher.publish(title, naver_url, tags)
+    except TistoryError:
+        console.print(f"\n[yellow]원고는 그대로 있습니다.[/yellow] 다시 올리려면:")
+        console.print(f"  python main.py upload --from {run_dir} --tistory-only")
+        raise
+
+    (run_dir / "tistory.url").write_text(url + "\n", encoding="utf-8")
+    if cfg.wants_public():
+        return (
+            f"티스토리 발행 완료: {url}\n"
+            f"  본문 링크: {naver_url}"
+        )
+    return f"티스토리 비공개 저장: {url}"
 
 
 def _review_before_upload(run_dir, title: str, tags: list[str], payload, *, md_path: str):
@@ -379,6 +571,31 @@ def _ask_page_url(buy_url: str, *, index: int = 0, total: int = 0) -> str:
         if answer.startswith(("http://", "https://")):
             return answer
         console.print("[yellow]http 로 시작하는 주소를 넣어주세요. 그냥 쓰려면 엔터.[/yellow]")
+
+
+def _handoff(url: str) -> bool:
+    """띄워 둔 브라우저 창을 사용자에게 넘기고, 준비될 때까지 기다린다.
+
+    수집이 막혔을 때와 상세 이미지를 한 장도 못 찾았을 때 모두 여기로 온다.
+    창에서 로그인·캡차를 끝내고 상품 페이지를 띄워 놓은 뒤 엔터를 누르면 그 화면
+    그대로 본문과 이미지를 긁는다.
+    """
+    console.print()
+    console.print(Panel(
+        f"[dim]열어 둔 주소[/dim]  {url}\n\n"
+        "브라우저 창에서 직접 해주세요.\n"
+        "  1. 로그인이나 캡차가 뜨면 끝내주세요.\n"
+        "  2. 읽어올 [bold]상품 상세 페이지[/bold]를 띄워주세요. (다른 주소로 옮겨가도 됩니다)\n"
+        "  3. 화면에 상품 내용이 보이면 여기서 엔터를 누르세요.\n\n"
+        "[dim]엔터를 누르면 지금 창에 보이는 화면에서 본문과 이미지를 긁습니다.[/dim]\n"
+        "[dim]그만두려면 q 를 입력하세요.[/dim]",
+        title="브라우저에서 직접 수집", title_align="left", border_style="cyan",
+    ))
+
+    try:
+        return input("> ").strip().lower() != "q"
+    except EOFError:  # 파이프로 실행한 경우, 기다릴 사람이 없다
+        return False
 
 
 def _choose_focus(options: list[FocusPoint]) -> FocusChoice:

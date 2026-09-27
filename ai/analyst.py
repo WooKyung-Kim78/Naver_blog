@@ -1,6 +1,6 @@
 """상품 페이지를 읽고 집필 설계도(ProductBrief)를 만든다.
 
-한 번의 호출로 특징, 타깃 고객, 사용 시나리오, 구매 고민, 장단점, FAQ, 추천 대상을
+한 번의 호출로 특징, 타깃 고객, 사용 시나리오, 구매 고민, 장단점, 추천 대상을
 모두 뽑는다. 이후 모든 집필 단계가 이 설계도만 참조하므로 원문을 반복해서 읽지 않는다.
 """
 
@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from ai.client import MyGenAssistClient
 from ai.prompts import BASE_RULES
-from core.models import FAQ, Concern, Feature, Persona, ProductBrief, Product, Scenario
+from core.models import Concern, Feature, Persona, ProductBrief, Product, Scenario
 
 _SCHEMA = """{
   "category": "상품 카테고리 (예: 골프 거리측정기, 수분 세럼)",
@@ -27,9 +27,8 @@ _SCHEMA = """{
   ],
   "pros": ["장점", "4~6개"],
   "cons": ["아쉬운 점. 반드시 솔직하게. 3개 이상", "장점만 쓰면 광고로 보여 신뢰를 잃는다"],
-  "faqs": [{"question": "실제로 검색할 법한 질문", "answer": "2~3문장 답변"}],
-  "recommended_for": ["이런 사람에게 추천", "3~4개"],
-  "not_recommended_for": ["이런 사람에겐 비추천", "2~3개"]
+  "recommended_for": ["이런 사람에게 추천. 인포그래픽에 그대로 들어가므로 35자 이내", "3개"],
+  "not_recommended_for": ["이런 사람에겐 비추천. 35자 이내", "2~3개"]
 }"""
 
 
@@ -45,7 +44,8 @@ def analyze(client: MyGenAssistClient, product: Product) -> ProductBrief:
 - concerns 는 3~4개. 가격, 학습 난이도, 대체재, AS 같은 현실적인 고민을 다룬다.
 - cons 는 반드시 3개 이상 채운다. 페이지에 단점이 없으면 "이런 사람에겐 과할 수 있다"
   같은 조건부 한계를 쓴다.
-- faqs 는 5개.
+- recommended_for 와 not_recommended_for 는 글 끝의 인포그래픽에 한 줄씩 그대로
+  들어간다. 길면 그림에서 두 줄로 넘어가 답답해지므로 35자를 넘기지 마라.
 
 아래 JSON 형식으로만 출력한다.
 
@@ -73,7 +73,6 @@ def analyze(client: MyGenAssistClient, product: Product) -> ProductBrief:
         concerns=[Concern(_s(c.get("worry")), _s(c.get("answer"))) for c in _list(data, "concerns")],
         pros=_strs(data.get("pros")),
         cons=_strs(data.get("cons")),
-        faqs=[FAQ(_s(f.get("question")), _s(f.get("answer"))) for f in _list(data, "faqs")],
         recommended_for=_strs(data.get("recommended_for")),
         not_recommended_for=_strs(data.get("not_recommended_for")),
     )

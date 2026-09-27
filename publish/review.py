@@ -77,7 +77,9 @@ def rebuild_from_notes(
         dest.write_text(notes, encoding="utf-8")
     persist_article(run_dir, rebuilt, seo)
     ops = naver_blocks.render(rebuilt)
-    return rebuilt.title, rebuilt.tags, [PostBlock(kind=op.kind, value=op.value) for op in ops]
+    return rebuilt.title, rebuilt.tags, [
+        PostBlock(kind=op.kind, value=op.value, query=op.query) for op in ops
+    ]
 
 
 def persist_article(run_dir: Path, article: Article, seo: SeoPlan | None = None) -> None:
@@ -85,16 +87,16 @@ def persist_article(run_dir: Path, article: Article, seo: SeoPlan | None = None)
     save_article(run_dir, article)
     (run_dir / "article.html").write_text(html_render.render(article, seo), encoding="utf-8")
     ops = naver_blocks.render(article)
-    (run_dir / "naver.txt").write_text(
-        "\n\n".join(f"[{op.kind}] {op.value}" for op in ops),
-        encoding="utf-8",
-    )
+    (run_dir / "naver.txt").write_text(naver_blocks.dump(ops), encoding="utf-8")
     (run_dir / "upload.json").write_text(
         json.dumps(
             {
                 "title": article.title,
                 "tags": article.tags,
-                "ops": [{"kind": op.kind, "value": op.value} for op in ops],
+                "ops": [
+                    {"kind": op.kind, "value": op.value, **({"query": op.query} if op.query else {})}
+                    for op in ops
+                ],
             },
             ensure_ascii=False,
             indent=2,

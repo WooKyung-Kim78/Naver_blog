@@ -88,12 +88,6 @@ class Concern:
 
 
 @dataclass
-class FAQ:
-    question: str
-    answer: str
-
-
-@dataclass
 class FocusPoint:
     """상세페이지를 읽고 뽑은 '이 글에서 밀어붙일 한 가지'. 사용자가 셋 중 하나를 고른다."""
 
@@ -135,7 +129,6 @@ class RoundupBrief:
     how_together: str = ""  # 같이 쓰면 어떻게 쓰는지
     recommended_for: list[str] = field(default_factory=list)
     not_recommended_for: list[str] = field(default_factory=list)
-    faqs: list[FAQ] = field(default_factory=list)
 
 
 @dataclass
@@ -150,7 +143,6 @@ class ProductBrief:
     concerns: list[Concern] = field(default_factory=list)
     pros: list[str] = field(default_factory=list)
     cons: list[str] = field(default_factory=list)
-    faqs: list[FAQ] = field(default_factory=list)
     recommended_for: list[str] = field(default_factory=list)
     not_recommended_for: list[str] = field(default_factory=list)
 
@@ -193,16 +185,17 @@ SLOT_HERO = "hero"  # 도입부 대표 이미지
 SLOT_PRODUCT = "product"  # 상품 소개
 SLOT_FEATURE = "feature"  # 주요 특징
 SLOT_LIFESTYLE = "lifestyle"  # 실사용 시나리오
-SLOT_INFOGRAPHIC = "infographic"  # FAQ / 정보 정리
+SLOT_INFOGRAPHIC = "infographic"  # 글 전체를 한 장으로 요약한 그림
 SLOT_CTA = "cta"  # 총평 및 CTA
 
 #: 이미지 출처. 숫자가 작을수록 우선순위가 높다.
-SOURCE_PRIORITY = {"detail": 1, "thumbnail": 2, "stock": 3, "ai": 4}
+#: infographic 은 우리가 직접 그린 것이라 사진과 경쟁시키지 않고 항상 먼저 쓴다.
+SOURCE_PRIORITY = {"infographic": 0, "detail": 1, "thumbnail": 2, "stock": 3, "ai": 4}
 
 
 @dataclass
 class ImageAsset:
-    source: str  # detail / thumbnail / stock / ai
+    source: str  # infographic / detail / thumbnail / stock / ai
     url: str = ""
     path: Path | None = None
     width: int = 0
@@ -223,6 +216,27 @@ class ImageAsset:
 # ------------------------------------------------------------------- 콘텐츠
 
 
+@dataclass
+class ProductCard:
+    """네이버 쇼핑 커넥트 상품 카드 한 장에 들어가는 정보.
+
+    카드 겉면(썸네일·상품명·판매처)은 긁어온 상품 정보로 채우고, data-linkdata 의
+    식별자는 링크에서 읽어낼 수 있는 것만 넣는다. creatorSpaceId 는 크리에이터마다
+    고정이라 .env 에서 받고, affiliateProductId 는 링크에 없으면 비운다.
+    """
+
+    #: 카드를 눌렀을 때 가는 주소. 제휴 추적이 붙은 구매 링크 그대로다.
+    href: str = ""
+    title: str = ""
+    subtitle: str = ""  # 브랜드 또는 판매처
+    thumbnail_url: str = ""
+    link_label: str = ""  # 카드 아래에 작게 보이는 도메인. naver.me 등
+    affiliate_url: str = ""  # 에디터가 붙이는 ac 파라미터를 뺀 주소
+    channel_product_no: str = ""
+    affiliate_product_id: str = ""
+    creator_space_id: str = ""
+
+
 #: 렌더러가 이해하는 블록 종류.
 KIND_HEADING = "heading"
 KIND_PARAGRAPH = "paragraph"
@@ -230,7 +244,6 @@ KIND_QUOTE = "quote"  # 인용 박스
 KIND_CALLOUT = "callout"  # 요약 / 강조 박스
 KIND_CHECKLIST = "checklist"
 KIND_TABLE = "table"
-KIND_FAQ = "faq"
 KIND_DIVIDER = "divider"
 KIND_IMAGE = "image"
 KIND_LINK = "link"  # 본문 중간에 끼워 넣는 구매 링크
@@ -251,10 +264,10 @@ class Block:
     items: list[str] = field(default_factory=list)  # checklist 전용
     headers: list[str] = field(default_factory=list)  # table 전용
     rows: list[list[str]] = field(default_factory=list)  # table 전용
-    qa: list[FAQ] = field(default_factory=list)  # faq 전용
     image: ImageAsset | None = None  # image / cta 전용
     slot: str = ""  # 이미지 자리표시자
     href: str = ""  # link / cta 전용
+    card: ProductCard | None = None  # link / cta 전용. 쇼핑 커넥트 카드 정보
 
     @property
     def plain_text(self) -> str:
@@ -263,8 +276,6 @@ class Block:
             return " ".join(self.items)
         if self.kind == KIND_TABLE:
             return " ".join(self.headers + [c for row in self.rows for c in row])
-        if self.kind == KIND_FAQ:
-            return " ".join(f"{f.question} {f.answer}" for f in self.qa)
         if self.kind in (KIND_IMAGE, KIND_DIVIDER):
             return self.image.caption if self.image else ""
         return self.text

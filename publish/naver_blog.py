@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -54,6 +55,19 @@ DIVIDER_BUTTON_SELECTORS = [
     "button[data-name='horizontalLine']",
     ".se-toolbar-item-horizontalLine button",
 ]
+SHOPPING_CONNECT_BUTTON_SELECTORS = [
+    "button.se-shopping-connect-toolbar-button",
+    "button[data-name='shopping-connect']",
+    ".se-toolbar-item-shopping-connect button",
+]
+#: 쇼핑 커넥트 팝업 내부. 상품을 검색해서 고르고 '추가하기' 로 확인하는 3단계다.
+SHOPPING_CONNECT_POPUP = ".se-popup-shopping-connect"
+SHOPPING_CONNECT_SEARCH_INPUT = "input.se-popup-search-input"
+SHOPPING_CONNECT_ITEM = "li.se-shopping-connect-item"
+SHOPPING_CONNECT_ITEM_NAME = ".se-shopping-connect-item-name"
+SHOPPING_CONNECT_ADD_BUTTON = "button.se-shopping-connect-item-add-button"
+SHOPPING_CONNECT_CONFIRM_BUTTON = "button.se-popup-button-confirm"
+
 CLOSE_POPUP_SELECTORS = [
     ".se-popup-button-cancel",
     ".se-popup-button-close",
@@ -68,8 +82,9 @@ class NaverBlogError(RuntimeError):
 
 @dataclass
 class PostBlock:
-    kind: str  # text / image / quote / divider
-    value: str = ""  # 텍스트 내용 또는 이미지 파일 경로
+    kind: str  # text / image / quote / divider / product
+    value: str = ""  # 텍스트 내용, 이미지 파일 경로, 또는 상품 카드 실패 시 쓸 텍스트
+    query: str = ""  # product 전용. 쇼핑 커넥트에서 상품을 찾을 검색어
 
 
 class NaverBlogPublisher:
@@ -325,6 +340,10 @@ class NaverBlogPublisher:
                 self._click_optional(frame, DIVIDER_BUTTON_SELECTORS)
             elif block.kind == "quote":
                 self._insert_quote(page, frame, block.value)
+            elif block.kind == "product":
+                if not self._insert_product_card(page, frame, block.query):
+                    self._paste_text(page, block.value)
+                    page.keyboard.press("Enter")
             else:
                 self._paste_text(page, block.value)
                 page.keyboard.press("Enter")
@@ -386,6 +405,78 @@ class NaverBlogPublisher:
             page.wait_for_timeout(4000)
         except (PlaywrightTimeout, NaverBlogError) as exc:
             print(f"  [!] 이미지 삽입 실패({path.name}): {exc}")
+
+    def _insert_product_card(self, page: Page, frame: FrameLocator, query: str) -> bool:
+        """툴바의 '쇼핑커넥트' 로 상품 카드를 넣는다. 못 넣으면 False.
+
+        제휴 링크는 에디터가 직접 발급하므로 우리는 어느 상품인지만 짚어 주면 된다.
+        대신 엉뚱한 상품을 고르면 남의 상품에 내 글을 붙이는 꼴이 되므로, 이름이
+        충분히 일치할 때만 넣고 애매하면 포기하고 텍스트 링크로 돌아간다.
+        """
+        if not query:
+            return False
+        if not self._click_optional(frame, SHOPPING_CONNECT_BUTTON_SELECTORS):
+            print("  [!] 쇼핑커넥트 버튼을 찾지 못해 텍스트 링크로 넣습니다.")
+            return False
+
+        try:
+            frame.locator(SHOPPING_CONNECT_POPUP).first.wait_for(state="visible", timeout=10_000)
+        except (PlaywrightTimeout, PlaywrightError):
+            print("  [!] 쇼핑커넥트 창이 열리지 않아 텍스트 링크로 넣습니다.")
+            return False
+
+        try:
+            # 최근 링크를 발급한 상품이 먼저 떠 있다. 거기 있으면 검색할 필요가 없다.
+            for term in [""] + _search_terms(query):
+                if term:
+                    self._search_products(page, frame, term)
+                index = _best_match(self._product_names(frame), query)
+                if index is not None:
+                    return self._add_product(page, frame, index, query)
+            print(f"  [!] 쇼핑 커넥트에서 '{query}' 를 찾지 못해 텍스트 링크로 넣습니다.")
+            self._snap("shopping_connect_no_match")
+            return False
+        except (PlaywrightTimeout, PlaywrightError) as exc:
+            print(f"  [!] 상품 카드 삽입 실패, 텍스트 링크로 넣습니다: {exc}")
+            return False
+        finally:
+            self._close_shopping_connect(page, frame)
+
+    def _search_products(self, page: Page, frame: FrameLocator, term: str) -> None:
+        search = frame.locator(f"{SHOPPING_CONNECT_SEARCH_INPUT} >> visible=true").first
+        search.click(timeout=8000)
+        page.keyboard.press("Control+A")
+        self._paste_text(page, term)
+        page.keyboard.press("Enter")
+        page.wait_for_timeout(3000)
+
+    def _product_names(self, frame: FrameLocator) -> list[str]:
+        try:
+            return frame.locator(f"{SHOPPING_CONNECT_ITEM} {SHOPPING_CONNECT_ITEM_NAME}").all_inner_texts()
+        except PlaywrightError:
+            return []
+
+    def _add_product(self, page: Page, frame: FrameLocator, index: int, query: str) -> bool:
+        item = frame.locator(SHOPPING_CONNECT_ITEM).nth(index)
+        item.locator(SHOPPING_CONNECT_ADD_BUTTON).first.click(timeout=8000)
+        page.wait_for_timeout(1500)
+        # 링크를 발급한다는 확인 창이 한 번 더 뜬다.
+        frame.locator(f"{SHOPPING_CONNECT_CONFIRM_BUTTON} >> visible=true").first.click(timeout=8000)
+        page.wait_for_timeout(4000)
+        print(f"  상품 카드 삽입: {query}")
+        return True
+
+    def _close_shopping_connect(self, page: Page, frame: FrameLocator) -> None:
+        """팝업이 남아 있으면 닫는다. 열린 채로 두면 다음 입력이 전부 엉킨다."""
+        try:
+            popup = frame.locator(SHOPPING_CONNECT_POPUP).first
+            if not popup.is_visible(timeout=1500):
+                return
+        except (PlaywrightTimeout, PlaywrightError):
+            return
+        if not self._click_optional(frame, [".se-popup-close-button", ".se-popup-button-cancel"]):
+            page.keyboard.press("Escape")
+        page.wait_for_timeout(1200)
 
     def _save_draft(self, page: Page, frame: FrameLocator) -> str:
         self._click_first(
@@ -473,3 +564,42 @@ class NaverBlogPublisher:
             self.page.screenshot(path=str(shot_dir / f"{int(time.time())}_{name}.png"), full_page=True)
         except PlaywrightError:
             pass
+
+
+def _search_terms(title: str) -> list[str]:
+    """상품명을 그대로 넣고, 안 나오면 앞쪽 단어만 남겨 가며 좁혀 본다.
+
+    긴 상품명을 통째로 넣으면 검색이 아무것도 못 찾는 경우가 있다.
+    """
+    words = title.split()
+    terms = [title]
+    for count in (5, 3):
+        if len(words) > count:
+            terms.append(" ".join(words[:count]))
+    return list(dict.fromkeys(terms))
+
+
+def _best_match(names: list[str], title: str) -> int | None:
+    """검색 결과 중 상품명이 확실히 같은 것 하나를 고른다. 애매하면 None.
+
+    이름이 거의 같은 형제 모델(NEPTUNE / URANUS ...)이 나란히 뜨는 일이 흔하다.
+    이 둘은 문자열 유사도가 0.88 이나 돼서 '비슷한 정도' 로 고르면 남의 상품에
+    내 글을 붙이게 된다. 그래서 띄어쓰기와 괄호를 덜어낸 뒤 정확히 같은 후보만
+    받고, 그마저 없으면 한쪽이 다른 쪽을 통째로 품은 후보가 딱 하나일 때만 고른다.
+    """
+    target = _normalize(title)
+    if not target:
+        return None
+
+    candidates = [_normalize(name) for name in names]
+    for i, candidate in enumerate(candidates):
+        if candidate and candidate == target:
+            return i
+
+    contained = [i for i, c in enumerate(candidates) if c and (c in target or target in c)]
+    return contained[0] if len(contained) == 1 else None
+
+
+def _normalize(name: str) -> str:
+    """띄어쓰기와 괄호 표기가 조금씩 달라서 비교 전에 덜어낸다."""
+    return re.sub(r"[\s\[\]()/_·,·]", "", name).lower()

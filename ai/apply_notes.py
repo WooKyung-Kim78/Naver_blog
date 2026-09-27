@@ -13,13 +13,11 @@ from core.models import (
     KIND_CALLOUT,
     KIND_CHECKLIST,
     KIND_CTA,
-    KIND_FAQ,
     KIND_HEADING,
     KIND_IMAGE,
     KIND_LINK,
     KIND_TABLE,
     Article,
-    FAQ,
     SeoPlan,
 )
 
@@ -121,9 +119,6 @@ def _outline(article: Article) -> str:
             lines.append(f"[{i}] checklist " + " / ".join(block.items))
         elif block.kind == KIND_TABLE:
             lines.append(f"[{i}] table headers={block.headers} rows={block.rows}")
-        elif block.kind == KIND_FAQ:
-            qa = " | ".join(f"Q.{f.question} A.{f.answer}" for f in block.qa)
-            lines.append(f"[{i}] faq {qa}")
         else:
             lines.append(f"[{i}] {block.kind} {block.text}")
     return "\n".join(lines)
@@ -157,13 +152,6 @@ def _merge(article: Article, data: dict, disclosure: str) -> Article:
             headers = [str(h) for h in (edit.get("headers") or block.headers)]
             rows = [list(map(str, row)) for row in (edit.get("rows") or block.rows)]
             blocks.append(replace(block, headers=headers, rows=rows))
-        elif block.kind == KIND_FAQ and edit.get("qa"):
-            qa = [
-                FAQ(question=str(f.get("question") or ""), answer=str(f.get("answer") or ""))
-                for f in edit["qa"]
-                if isinstance(f, dict)
-            ]
-            blocks.append(replace(block, qa=qa or block.qa))
         elif block.kind in (KIND_LINK, KIND_CTA):
             text = str(edit.get("text") or block.text).strip()
             blocks.append(replace(block, text=text or block.text))

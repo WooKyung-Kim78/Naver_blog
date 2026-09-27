@@ -5,13 +5,13 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
+from urllib.parse import urlparse
 
 from core.models import (
     KIND_CALLOUT,
     KIND_CHECKLIST,
     KIND_CTA,
     KIND_DIVIDER,
-    KIND_FAQ,
     KIND_HEADING,
     KIND_IMAGE,
     KIND_LINK,
@@ -20,8 +20,8 @@ from core.models import (
     KIND_TABLE,
     Article,
     Block,
-    FAQ,
     ImageAsset,
+    ProductCard,
 )
 from publish.naver_blog import PostBlock
 
@@ -70,11 +70,17 @@ def article_from_ops(title: str, tags: list[str], payload: list[PostBlock], disc
         if op.kind == "image":
             image = ImageAsset(source="detail", path=Path(op.value) if op.value else None)
             nxt = payload[i + 1] if i + 1 < len(payload) else None
-            if nxt and nxt.kind == "text" and "👉" in nxt.value and _URL_RE.search(nxt.value):
+            if nxt and nxt.kind in ("text", "product") and "👉" in nxt.value and _URL_RE.search(nxt.value):
                 href = _first_url(nxt.value)
                 text = _link_label(nxt.value)
                 kind = KIND_CTA if "─" in nxt.value else KIND_LINK
-                blocks.append(Block(kind=kind, text=text, href=href, image=image if kind == KIND_CTA else None))
+                blocks.append(Block(
+                    kind=kind,
+                    text=text,
+                    href=href,
+                    image=image if kind == KIND_CTA else None,
+                    card=_card(nxt, href),
+                ))
                 i += 2
                 continue
             blocks.append(Block(kind=KIND_IMAGE, image=image))
@@ -85,9 +91,27 @@ def article_from_ops(title: str, tags: list[str], payload: list[PostBlock], disc
         elif op.kind == "divider":
             blocks.append(Block(kind=KIND_DIVIDER))
         else:
-            blocks.append(_text_block(op.value, disclosure))
+            block = _text_block(op.value, disclosure)
+            if block.kind == KIND_LINK:
+                block.card = _card(op, block.href)
+            blocks.append(block)
         i += 1
     return Article(title=title, tags=tags, blocks=blocks, disclosure=disclosure)
+
+
+def _card(op: PostBlock, href: str) -> ProductCard | None:
+    """상품 카드로 넣기로 했던 링크는 다시 카드로 복원한다.
+
+    업로드 묶음에는 검색어(상품명)만 남아 있어서 썸네일 같은 나머지는 비게 된다.
+    """
+    if op.kind != "product" or not op.query:
+        return None
+    return ProductCard(href=href, title=op.query, link_label=_host(href))
+
+
+def _host(url: str) -> str:
+    host = urlparse(url).netloc
+    return host[4:] if host.startswith("www.") else host
 
 
 def _text_block(value: str, disclosure: str) -> Block:
@@ -130,7 +154,6 @@ def _block_to_dict(block: Block) -> dict:
         "rows": block.rows,
         "slot": block.slot,
         "href": block.href,
-        "qa": [{"question": f.question, "answer": f.answer} for f in block.qa],
     }
     if block.image:
         img = block.image
@@ -146,6 +169,8 @@ def _block_to_dict(block: Block) -> dict:
             "slot": img.slot,
             "owner": img.owner,
         }
+    if block.card:
+        data["card"] = dict(block.card.__dict__)
     return data
 
 
@@ -166,6 +191,11 @@ def _block_from_dict(data: dict) -> Block:
             slot=str(raw.get("slot") or ""),
             owner=str(raw.get("owner") or ""),
         )
+    card = None
+    raw_card = data.get("card")
+    if isinstance(raw_card, dict):
+        known = ProductCard().__dict__
+        card = ProductCard(**{k: str(raw_card.get(k) or "") for k in known})
     return Block(
         kind=str(data.get("kind") or KIND_PARAGRAPH),
         text=str(data.get("text") or ""),
@@ -174,8 +204,8 @@ def _block_from_dict(data: dict) -> Block:
         items=list(data.get("items") or []),
         headers=list(data.get("headers") or []),
         rows=[list(row) for row in data.get("rows") or []],
-        qa=[FAQ(question=str(f.get("question") or ""), answer=str(f.get("answer") or "")) for f in data.get("qa") or []],
         image=image,
         slot=str(data.get("slot") or ""),
         href=str(data.get("href") or ""),
+        card=card,
     )

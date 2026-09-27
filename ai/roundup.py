@@ -16,7 +16,6 @@ from core.models import (
     KIND_CHECKLIST,
     KIND_CTA,
     KIND_DIVIDER,
-    KIND_FAQ,
     KIND_HEADING,
     KIND_IMAGE,
     KIND_LINK,
@@ -28,7 +27,6 @@ from core.models import (
     SLOT_LIFESTYLE,
     Article,
     Block,
-    FAQ,
     FocusPoint,
     Product,
     ProductBrief,
@@ -44,9 +42,8 @@ _ANALYZE_SCHEMA = """{
   "commonalities": ["실제로 겹치는 점", "3~5개. 페이지에 근거가 있어야 한다"],
   "differences": ["서로 다른 점. 역할이 어떻게 나뉘는지", "2~4개"],
   "how_together": "실제로 같이 쓰는 순서나 장면. 2~4문장",
-  "recommended_for": ["이 조합이 맞는 사람", "2~4개"],
-  "not_recommended_for": ["이 조합이 과한 사람", "2개"],
-  "faqs": [{"question": "조합을 살 때 나올 법한 질문", "answer": "2~3문장"}]
+  "recommended_for": ["이 조합이 맞는 사람. 인포그래픽에 그대로 들어가므로 35자 이내", "3개"],
+  "not_recommended_for": ["이 조합이 과한 사람. 35자 이내", "2개"]
 }"""
 
 _THEME_SCHEMA = """{
@@ -88,9 +85,9 @@ _BACK_SCHEMA = """{
   "compare_rows": [["역할", "...", "..."], ["이런 때", "...", "..."]],
   "who_lead": "누구에게 맞는지 한 문장",
   "who_items": ["추천 대상", "3~4개"],
-  "faq_lead": "FAQ 도입 한 문장",
+  "summary_lead": "한눈에 보기 도입 한 문장. 아래 그림에 무엇이 정리돼 있는지 알려준다",
   "verdict": "총평. 2문단. 세트로 살지, 골라 살지 분명히",
-  "summary_box": ["3줄 요약", "각 줄 30자 내외", "3개"],
+  "summary_box": ["3줄 요약. 글 끝 인포그래픽에도 그대로 들어간다", "각 줄 35자 이내", "3개"],
   "cta": "마지막 안내. URL 쓰지 마라",
   "tags": ["태그", "# 없이 8~12개"]
 }"""
@@ -112,7 +109,8 @@ def analyze(
   상품명을 나열한 제목은 실패다.
 - commonalities 는 모든 상품에 실제로 있는 점이어야 한다. 없으면 솔직히 적게 써라.
 - how_together 는 같이 쓰는 순서나 장면을 구체적으로. "잘 어울린다"는 쓰지 마라.
-- faqs 는 4개. 세트로 사야 하는지, 하나만 골라도 되는지 같은 질문을 넣어라.
+- recommended_for 와 not_recommended_for 는 글 끝의 인포그래픽에 한 줄씩 그대로
+  들어간다. 길면 그림에서 두 줄로 넘어가므로 35자를 넘기지 마라.
 
 아래 JSON 형식으로만 출력한다.
 
@@ -122,11 +120,6 @@ def analyze(
     if not isinstance(data, dict):
         raise RuntimeError("조합 분석 응답이 JSON 객체가 아닙니다.")
 
-    faqs = [
-        FAQ(question=_s(f.get("question")), answer=_s(f.get("answer")))
-        for f in (data.get("faqs") or [])
-        if isinstance(f, dict) and _s(f.get("question"))
-    ]
     return RoundupBrief(
         theme=_s(data.get("theme")),
         one_liner=_s(data.get("one_liner")),
@@ -135,7 +128,6 @@ def analyze(
         how_together=_s(data.get("how_together")),
         recommended_for=_strs(data.get("recommended_for")),
         not_recommended_for=_strs(data.get("not_recommended_for")),
-        faqs=faqs,
     )
 
 
@@ -270,7 +262,7 @@ def write(
         WRITER_RULES,
         f"""{context}
 
-지금은 글의 뒷부분만 쓴다. 비교표, 추천 대상, FAQ, 총평이다.
+지금은 글의 뒷부분만 쓴다. 비교표, 추천 대상, 한눈에 보기, 총평이다.
 
 - compare_headers 첫 칸은 '구분', 나머지는 상품 짧은 이름. 상품 수는 {len(products)}개.
   예: ["구분", {short}]
@@ -366,12 +358,9 @@ def _assemble(
     if combo.not_recommended_for:
         add(KIND_CALLOUT, text="\n".join(f"· {c}" for c in combo.not_recommended_for), style="warn")
 
-    add(KIND_HEADING, text=h2("FAQ", "자주 묻는 질문"), level=2)
+    add(KIND_HEADING, text=h2("한눈에", "한눈에 보기"), level=2)
+    _add_paragraphs(blocks, back.get("summary_lead"))
     add(KIND_IMAGE, slot=SLOT_INFOGRAPHIC)
-    _add_paragraphs(blocks, back.get("faq_lead"))
-    faqs = combo.faqs
-    if faqs:
-        add(KIND_FAQ, qa=faqs)
 
     add(KIND_HEADING, text=h2("총평", "총평"), level=2)
     _add_paragraphs(blocks, back.get("verdict"))

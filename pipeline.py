@@ -33,6 +33,7 @@ from core.models import (
     KIND_CTA,
     KIND_IMAGE,
     KIND_LINK,
+    SLOT_INFOGRAPHIC,
     Article,
     Draft,
     FocusChoice,
@@ -43,18 +44,23 @@ from core.models import (
     RoundupBrief,
     SeoPlan,
 )
+from media import infographic
 from media.evaluator import ImageProcessor
 from media.generator import ImageGenerator
 from media.planner import ImagePlanner
 from media.stock import StockImageFetcher
 from render import html as html_render
 from render import naver_blocks
+from core import shopping_connect
 from core.article_io import save_article
 from publish.review import SUGGESTIONS_FILE, SUGGESTIONS_TEMPLATE
 from scrape import product as product_scraper
 
 Reporter = Callable[[str], None]
 Chooser = Callable[[list[FocusPoint]], FocusChoice]
+#: 수집이 막혔을 때 브라우저 창을 띄우고 사용자가 직접 통과시키게 하는 콜백.
+#: 주소를 받아 안내를 띄우고, 사용자가 준비될 때까지 막아 둔 뒤 진행 여부를 돌려준다.
+Handoff = Callable[[str], bool]
 
 #: 재제안을 무한정 돌면 토큰만 태운다. 이 횟수를 넘기면 포인트 없이 진행한다.
 MAX_FOCUS_ROUNDS = 4
@@ -84,10 +90,23 @@ class PipelineResult:
 
 
 class Pipeline:
-    def __init__(self, *, report: Reporter | None = None, choose: Chooser | None = None):
+    def __init__(
+        self,
+        *,
+        report: Reporter | None = None,
+        choose: Chooser | None = None,
+        handoff: Handoff | None = None,
+        handoff_on_block: bool = False,
+    ):
         self.report = report or (lambda _: None)
         # 콜백이 없으면 첫 번째 안을 자동 선택한다 (비대화형 실행용).
         self.choose = choose or (lambda options: FocusChoice(point=options[0]))
+        # 없으면 수집이 막혔을 때 그냥 포기한다 (비대화형 실행용).
+        self.handoff = handoff
+        # 수집이 막힌 단계에서도 곧바로 창을 띄울지(--browser). 꺼져 있으면 쉬었다
+        # 다시 긁어보고 포기한다. 상세 이미지가 한 장도 없을 때는 이 값과 무관하게
+        # 창을 띄운다.
+        self.handoff_on_block = handoff_on_block
         self.ai_cfg = config.load_ai_config()
         self.img_cfg = config.load_image_config()
         self.gen_cfg = config.load_imagegen_config()
@@ -119,9 +138,12 @@ class Pipeline:
         run_dir = config.OUTPUT_DIR / f"{stamp}_{_slug(product.title)}"
         available = self._prepare_images(product, run_dir)
 
-        self.report("상품 분석 중 (특징·타깃·시나리오·장단점·FAQ)")
+        self.report("상품 분석 중 (특징·타깃·시나리오·장단점·추천대상)")
         brief = analyst.analyze(self.client, product)
-        self.report(f"  카테고리: {brief.category} / 특징 {len(brief.features)}개 / FAQ {len(brief.faqs)}개")
+        self.report(
+            f"  카테고리: {brief.category} / 특징 {len(brief.features)}개 / "
+            f"추천대상 {len(brief.recommended_for)}개"
+        )
 
         focus, options = self._pick_focus(product, brief, available)
 
@@ -197,7 +219,9 @@ class Pipeline:
 
         draft, attempts = self._write_roundup_until_good(products, briefs, combo, seo, focus)
 
-        images = self._place_roundup_images(products, lead_brief, seo, draft.article, run_dir, available)
+        images = self._place_roundup_images(
+            products, lead_brief, combo, seo, draft.article, run_dir, available
+        )
         run_dir = _rename_run_dir(
             run_dir, config.OUTPUT_DIR / f"{stamp}_{_slug(draft.article.title)}",
             draft.article, images,
@@ -217,7 +241,7 @@ class Pipeline:
     def _collect_product(
         self, buy_url: str, page_url: str, manual_desc: str, collect_images: bool
     ) -> Product:
-        product, page_url = self._scrape_with_fallback(buy_url, page_url)
+        product, page_url, by_hand = self._scrape_with_fallback(buy_url, page_url, collect_images)
 
         # 긁는 주소와 본문에 넣을 구매 링크는 다를 수 있다. 링크는 제휴 추적이 붙은
         # 쪽을 써야 하므로 여기서 갈아 끼운다.
@@ -228,10 +252,9 @@ class Pipeline:
             self.report(f"  본문 구매 링크: {buy_url}")
         self.report(f"  상품명: {product.title or '(못 찾음)'}")
 
-        if manual_desc:
-            product.body_text = f"{manual_desc}\n\n{product.body_text}"
-
-        if collect_images:
+        # 수동 브라우저로 받아온 경우 그 창에서 이미지까지 이미 긁었다. 다시 열면
+        # 사용자가 통과시킨 화면을 잃고 또 막힌다.
+        if collect_images and not product.detail_image_urls:
             self.report("상세페이지 이미지 탐색 중 (스크롤하며 지연 로딩 유도)")
             from media import product_images
 
@@ -241,25 +264,77 @@ class Pipeline:
             product.detail_image_urls = [a.url for a in details]
             self.report(f"  썸네일 {len(product.thumbnail_urls)}개 / 상세 이미지 {len(product.detail_image_urls)}개")
 
+        if collect_images and not product.detail_image_urls and not by_hand:
+            self._collect_images_by_hand(product)
+
+        if manual_desc:
+            product.body_text = f"{manual_desc}\n\n{product.body_text}"
+
         self.report(f"  본문 {len(product.body_text):,}자 / 스펙 {len(product.specs)}항목")
         if not manual_desc:
             _require_product_signal(product)
         return product
 
-    def _scrape_with_fallback(self, buy_url: str, page_url: str) -> tuple[Product, str]:
+    def _collect_images_by_hand(self, product: Product) -> None:
+        """상세 이미지를 한 장도 못 건졌으면 막히지 않았어도 창을 띄운다.
+
+        상세설명 이미지는 끝까지 스크롤하고 '펼쳐보기'를 눌러야 지연 로딩이 도는데,
+        headless 브라우저는 그 전에 로그인·캡차로 돌려보내지거나 빈 화면을 받는다.
+        상세 이미지가 없으면 상품을 눈으로 확인하지 못한 채 글을 쓰게 되므로
+        (집중 포인트도 본문 텍스트만으로 뽑힌다) 여기서는 사람 손을 빌린다.
+        """
+        page_url = product.page_url or product.url
+
+        if not self.handoff:
+            self.report("  상세 이미지가 0개입니다. 창을 넘겨줄 사람이 없어 그냥 진행합니다.")
+            return
+
+        from scrape import manual
+
+        self.report("상세 이미지가 0개입니다. 브라우저 창에서 직접 수집합니다.")
+        try:
+            collected = manual.fetch(
+                page_url,
+                wait=lambda: self.handoff(page_url),
+                collect_images=True,
+                report=self.report,
+            )
+        except Exception as exc:  # noqa: BLE001 - 이미 본문과 썸네일은 확보한 상태다
+            # 사용자가 그만뒀거나 창을 띄우지 못했어도 원고는 쓸 수 있다.
+            self.report(f"  브라우저 수집을 건너뜁니다: {exc}")
+            return
+
+        product_scraper.merge(product, collected)
+        product.detail_image_urls = collected.detail_image_urls
+        product.resolved_url = collected.resolved_url or product.resolved_url
+        self.report(
+            f"  썸네일 {len(product.thumbnail_urls)}개 / "
+            f"상세 이미지 {len(product.detail_image_urls)}개"
+        )
+
+    def _scrape_with_fallback(
+        self, buy_url: str, page_url: str, collect_images: bool = True
+    ) -> tuple[Product, str, bool]:
         """판매 페이지가 막히면 구매 링크로, 그래도 안 되면 좀 쉬었다 다시 시도한다.
 
         네이버는 smartstore 직접 주소로 들어오는 자동 접근을 로그인 페이지로 돌려보낸다.
         같은 상품이라도 제휴 링크로 들어가면 통과하는 경우가 많아서 그쪽으로 갈아탄다.
         연달아 긁으면 아예 차단당하는데, 이때는 '상품이 없다'는 얼굴로 오기도 해서
         기다렸다 다시 해보기 전에는 진짜 삭제와 구분할 수 없다.
+
+        마지막 값은 창을 띄워 사람이 통과시킨 화면에서 읽었는지 여부다. 그 경우
+        상세 이미지까지 그 창에서 이미 긁었으므로 다시 띄우지 않는다.
         """
         urls = [page_url] + ([buy_url] if buy_url != page_url else [])
         problem = ""
 
-        for attempt in range(1, SCRAPE_ROUNDS + 1):
+        # 브라우저로 넘길 수 있으면 오래 기다리지 않는다. 사용자가 앞에 앉아 있는데
+        # 몇 분씩 재시도를 지켜보게 할 이유가 없다.
+        rounds = 1 if self.handoff_on_block else SCRAPE_ROUNDS
+
+        for attempt in range(1, rounds + 1):
             if attempt > 1:
-                self.report(f"{SCRAPE_COOLDOWN}초 기다렸다 다시 시도합니다 ({attempt}/{SCRAPE_ROUNDS})")
+                self.report(f"{SCRAPE_COOLDOWN}초 기다렸다 다시 시도합니다 ({attempt}/{rounds})")
                 time.sleep(SCRAPE_COOLDOWN)
 
             for index, url in enumerate(urls):
@@ -272,19 +347,63 @@ class Pipeline:
 
                 problem = product_scraper.diagnose(product)
                 if not problem:
-                    return product, url
+                    return product, url, False
 
                 self.report(f"  [막힘] {problem}")
                 if index + 1 < len(urls):
                     self.report("  구매 링크로 다시 시도합니다.")
 
+            # 주소를 다 시도해 보고도 막혔으면 창을 띄워 사용자에게 넘긴다.
+            if self.handoff_on_block:
+                collected = self._scrape_by_hand(page_url, collect_images=collect_images)
+                if collected is not None:
+                    return collected, collected.resolved_url or page_url, True
+
         raise product_scraper.ProductUnavailable(
             f"상품 페이지를 읽지 못했습니다. {problem}.\n"
             f"  시도한 주소: {', '.join(urls)}\n"
             "  네이버가 짧은 시간에 반복 접속을 막습니다. 몇 분 뒤에 다시 실행해 보세요.\n"
-            "  판매 페이지를 브라우저로 직접 열어 정상인지도 확인해 보세요.\n"
-            "  계속 막히면 --desc 로 상품 설명을 직접 넣어 진행할 수 있습니다."
+            + (
+                ""
+                if self.handoff_on_block
+                else "  --browser 를 붙이면 브라우저 창을 띄워 직접 로그인·인증을 끝낸 뒤\n"
+                     "  그 화면에서 상품 정보를 읽어옵니다.\n"
+            )
+            + "  계속 막히면 --desc 로 상품 설명을 직접 넣어 진행할 수 있습니다."
         )
+
+    def _scrape_by_hand(self, page_url: str, *, collect_images: bool = True) -> Product | None:
+        """브라우저 창을 띄워 사용자가 직접 통과시킨 화면에서 읽는다.
+
+        여기서 실패해도 예외로 끝내지 않는다. 호출한 쪽이 원래의 '막혔다' 안내를
+        띄우는 편이 사용자에게 더 쓸모 있다. 다만 사용자가 그만두겠다고 한 경우만은
+        자동 재시도로 더 붙잡아 두지 않는다.
+        """
+        from scrape import manual
+
+        self.report("브라우저 창을 띄웁니다. 직접 상품 페이지를 열어주세요.")
+        try:
+            product = manual.fetch(
+                page_url,
+                wait=lambda: self.handoff(page_url),
+                collect_images=collect_images,
+                report=self.report,
+            )
+        except manual.ManualCancelled as exc:
+            raise product_scraper.ProductUnavailable(
+                f"{exc}\n"
+                f"  주소: {page_url}\n"
+                "  --desc 로 상품 설명을 직접 넣어 진행할 수도 있습니다."
+            ) from None
+        except manual.ManualUnavailable as exc:
+            self.report(f"  [수동 수집 실패] {exc}")
+            return None
+
+        problem = product_scraper.diagnose(product)
+        if problem:
+            self.report(f"  [막힘] 창에서 읽은 화면도 쓸 수 없습니다: {problem}")
+            return None
+        return product
 
     def _prepare_images(
         self, product: Product, run_dir: Path, *, owner: str = ""
@@ -543,13 +662,17 @@ class Pipeline:
             self.report("  AI 이미지 생성은 비활성 상태입니다 (.env 의 IMAGE_GEN_* 미설정).")
 
         planner = ImagePlanner(stock=stock, generator=generator, processor=processor, image_dir=image_dir)
-        placed = planner.assign(slots, available, brief, stock_query=_stock_query(brief, seo))
+        placed = planner.assign(
+            [s for s in slots if s != SLOT_INFOGRAPHIC], available, brief, stock_query=_stock_query(brief, seo)
+        )
+        self._draw_infographic(infographic.from_brief(product, brief, article), image_dir, placed)
 
         for block in article.blocks:
             if block.kind in (KIND_IMAGE, KIND_CTA) and block.slot in placed:
                 block.image = placed[block.slot]
             if block.kind in (KIND_CTA, KIND_LINK) and not block.href:
                 block.href = product.url
+        shopping_connect.attach(article, [product], self.post_cfg.creator_space_id)
 
         # 이미지를 못 채운 슬롯은 빈 자리로 남기지 않고 지운다.
         article.blocks = [
@@ -561,10 +684,31 @@ class Pipeline:
 
         return placed
 
+    def _draw_infographic(
+        self, data: infographic.InfographicData, image_dir: Path, placed: dict[str, ImageAsset]
+    ) -> None:
+        """글 전체 요약 그림을 그려 인포그래픽 슬롯에 꽂는다.
+
+        이 자리만큼은 사진을 고르게 두지 않는다. '한눈에 보기' 아래에 상세페이지
+        사진이 들어가면 제목과 그림이 따로 놀기 때문이다. 못 그리면 슬롯을 비우고,
+        비면 뒤에서 그 이미지 블록 자체가 지워진다.
+        """
+        try:
+            asset = infographic.render(data, image_dir)
+        except Exception as exc:  # noqa: BLE001 - 그림 하나 때문에 원고를 잃을 수는 없다
+            self.report(f"  인포그래픽을 그리지 못했습니다: {exc}")
+            return
+        if not asset:
+            self.report("  인포그래픽에 넣을 내용이 없어 건너뜁니다.")
+            return
+        asset.slot = SLOT_INFOGRAPHIC
+        placed[SLOT_INFOGRAPHIC] = asset
+
     def _place_roundup_images(
         self,
         products: list[Product],
         brief: ProductBrief,
+        combo: RoundupBrief,
         seo: SeoPlan,
         article: Article,
         run_dir: Path,
@@ -603,7 +747,7 @@ class Pipeline:
                     return max(candidates, key=lambda a: a.score)
             return None
 
-        shared = [s for s in slots if not s.startswith(("item", "cta"))]
+        shared = [s for s in slots if not s.startswith(("item", "cta")) and s != SLOT_INFOGRAPHIC]
         owned = [s for s in slots if s.startswith(("item", "cta"))]
 
         for slot in owned:
@@ -619,10 +763,12 @@ class Pipeline:
         leftovers = [a for a in available if a.phash is None or a.phash not in used]
         shared_placed = planner.assign(shared, leftovers, brief, stock_query=_stock_query(brief, seo))
         placed.update(shared_placed)
+        self._draw_infographic(infographic.from_roundup(combo, article), image_dir, placed)
 
         for block in article.blocks:
             if block.kind in (KIND_IMAGE, KIND_CTA) and block.slot in placed:
                 block.image = placed[block.slot]
+        shopping_connect.attach(article, products, self.post_cfg.creator_space_id)
 
         article.blocks = [
             b for b in article.blocks if not (b.kind == KIND_IMAGE and b.image is None)
@@ -656,17 +802,17 @@ class Pipeline:
         if not suggestions.exists():
             suggestions.write_text(SUGGESTIONS_TEMPLATE, encoding="utf-8")
         ops = naver_blocks.render(draft.article)
-        (run_dir / "naver.txt").write_text(
-            "\n\n".join(f"[{op.kind}] {op.value}" for op in ops),
-            encoding="utf-8",
-        )
+        (run_dir / "naver.txt").write_text(naver_blocks.dump(ops), encoding="utf-8")
         # 업로드만 다시 할 때 원고 생성을 건너뛰기 위한 묶음.
         (run_dir / "upload.json").write_text(
             json.dumps(
                 {
                     "title": draft.article.title,
                     "tags": draft.article.tags,
-                    "ops": [{"kind": op.kind, "value": op.value} for op in ops],
+                    "ops": [
+                        {"kind": op.kind, "value": op.value, **({"query": op.query} if op.query else {})}
+                        for op in ops
+                    ],
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -687,14 +833,7 @@ class Pipeline:
                         {"buy_url": p.url, "page_url": p.page_url, "title": p.title, "price": p.price}
                         for p in (products or [product])
                     ],
-                    "roundup": (
-                        {
-                            **{k: v for k, v in combo.__dict__.items() if k != "faqs"},
-                            "faqs": [f.__dict__ for f in combo.faqs],
-                        }
-                        if combo
-                        else None
-                    ),
+                    "roundup": dict(combo.__dict__) if combo else None,
                     "brief": {
                         "category": brief.category,
                         "features": [f.__dict__ for f in brief.features],
@@ -702,7 +841,8 @@ class Pipeline:
                         "scenarios": [s.__dict__ for s in brief.scenarios],
                         "pros": brief.pros,
                         "cons": brief.cons,
-                        "faqs": [f.__dict__ for f in brief.faqs],
+                        "recommended_for": brief.recommended_for,
+                        "not_recommended_for": brief.not_recommended_for,
                     },
                     "focus": focus.__dict__ if focus else None,
                     "focus_options": [f.__dict__ for f in options],

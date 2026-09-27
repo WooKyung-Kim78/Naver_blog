@@ -24,6 +24,7 @@ load_dotenv(ROOT / ".env")
 OUTPUT_DIR = ROOT / "output"
 STORAGE_DIR = ROOT / "storage"
 SESSION_FILE = STORAGE_DIR / "naver_session.json"
+TISTORY_SESSION_FILE = STORAGE_DIR / "tistory_session.json"
 
 for _d in (OUTPUT_DIR, STORAGE_DIR):
     _d.mkdir(exist_ok=True)
@@ -147,9 +148,43 @@ class NaverConfig:
 
 
 @dataclass
+class TistoryConfig:
+    """티스토리 발행. 공식 Open API 는 종료되어 브라우저 세션으로 올린다."""
+
+    blog_name: str
+    category: str
+    #: "" 이면 POST_MODE 를 따른다. 0 비공개, 3 공개(구글 수집 대상).
+    visibility: str
+    post_mode: str
+    headed: bool
+
+    @property
+    def home(self) -> str:
+        return f"https://{self.blog_name}.tistory.com"
+
+    def wants_public(self) -> bool:
+        if self.visibility == "3":
+            return True
+        if self.visibility == "0":
+            return False
+        return self.post_mode == "publish"
+
+    def validate(self) -> None:
+        if not self.blog_name:
+            raise ConfigError(
+                "TISTORY_BLOG_NAME 이 비어 있습니다. 주소가 wkkim97.tistory.com 이면 wkkim97 입니다."
+            )
+        if self.visibility and self.visibility not in ("0", "3"):
+            raise ConfigError("TISTORY_VISIBILITY 는 비우거나 0(비공개), 3(공개) 이어야 합니다.")
+
+
+@dataclass
 class PostConfig:
     disclosure: str
     persona: str
+    #: 쇼핑 커넥트 상품 카드의 creatorSpaceId. 크리에이터마다 고정이고 구매 링크에는
+    #: 들어 있지 않아서 직접 받는다. 비워 두면 카드에서 그 항목만 빠진다.
+    creator_space_id: str = ""
 
 
 def _proxies() -> dict[str, str]:
@@ -218,6 +253,28 @@ def load_naver_config() -> NaverConfig:
     )
 
 
+def _blog_name(raw: str) -> str:
+    """wkkim97.tistory.com 이나 카테고리 주소를 블로그 이름으로 줄인다."""
+    name = raw.strip().rstrip("/")
+    for prefix in ("https://", "http://"):
+        if name.startswith(prefix):
+            name = name[len(prefix):]
+    name = name.split("/")[0]
+    if name.endswith(".tistory.com"):
+        name = name[: -len(".tistory.com")]
+    return name
+
+
+def load_tistory_config() -> TistoryConfig:
+    return TistoryConfig(
+        blog_name=_blog_name(_get("TISTORY_BLOG_NAME")),
+        category=_get("TISTORY_CATEGORY"),
+        visibility=_get("TISTORY_VISIBILITY"),
+        post_mode=_get("POST_MODE", "draft").lower(),
+        headed=_get_bool("BROWSER_HEADED", True),
+    )
+
+
 def load_post_config() -> PostConfig:
     return PostConfig(
         disclosure=_get(
@@ -225,4 +282,5 @@ def load_post_config() -> PostConfig:
             "이 글에는 쇼핑 커넥트 상품이 포함되어 있으며, 상품 판매 시 크리에이터는 수수료를 받습니다.",
         ),
         persona=_get("BLOG_PERSONA", "친근하고 솔직한 리뷰어 말투"),
+        creator_space_id=_get("NAVER_CREATOR_SPACE_ID"),
     )

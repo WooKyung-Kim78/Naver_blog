@@ -78,7 +78,7 @@ def fetch(url: str, *, verify_ssl: bool = True, proxies: dict | None = None) -> 
     if _is_naver_commerce(url):
         rendered, final_url, state = _fetch_rendered(url)
         if rendered:
-            product = _merge(product, _parse(url, rendered))
+            product = merge(product, parse(url, rendered))
         product.resolved_url = final_url or product.resolved_url
         if state:
             from scrape import naver_state
@@ -88,12 +88,12 @@ def fetch(url: str, *, verify_ssl: bool = True, proxies: dict | None = None) -> 
 
     html = _fetch_static(url, verify_ssl=verify_ssl, proxies=proxies)
     if html:
-        product = _merge(product, _parse(url, html))
+        product = merge(product, parse(url, html))
 
     if len(product.body_text) < MIN_TEXT_LENGTH:
         rendered, final_url, state = _fetch_rendered(url)
         if rendered:
-            product = _merge(product, _parse(url, rendered))
+            product = merge(product, parse(url, rendered))
         product.resolved_url = final_url or product.resolved_url
         if state:
             from scrape import naver_state
@@ -185,12 +185,17 @@ def _fetch_rendered(url: str) -> tuple[str, str, dict]:
             state = naver_state.read_from_page(page)
             html, final_url = page.content(), page.url
 
-            if not _looks_dead(html):
+            if not looks_dead(html):
+                from scrape.detail_ui import expand_collapsed_detail, open_detail_tab
+
+                open_detail_tab(page)
+                expand_collapsed_detail(page)
                 for _ in range(4):
+                    expand_collapsed_detail(page)
                     page.mouse.wheel(0, 2500)
                     page.wait_for_timeout(1200)
                     grown = page.content()
-                    if _looks_dead(grown):
+                    if looks_dead(grown):
                         break
                     html, final_url = grown, page.url
                     if not state:
@@ -202,14 +207,14 @@ def _fetch_rendered(url: str) -> tuple[str, str, dict]:
         return "", "", {}
 
 
-def _looks_dead(html: str) -> bool:
+def looks_dead(html: str) -> bool:
     """페이지가 오류 화면으로 갈아치워졌는지 제목과 앞부분만 보고 빠르게 판단한다."""
     title = re.search(r"<title[^>]*>(.*?)</title>", html, re.S | re.I)
     haystack = f"{title.group(1) if title else ''}\n{html[:4000]}".lower()
     return any(m in haystack for m in DEAD_PAGE_MARKERS + THROTTLE_MARKERS)
 
 
-def _parse(url: str, html: str) -> Product:
+def parse(url: str, html: str) -> Product:
     soup = BeautifulSoup(html, "lxml")
     product = Product(url=url)
 
@@ -360,7 +365,7 @@ def _apply_json_ld(soup: BeautifulSoup, product: Product, url: str) -> None:
                     product.thumbnail_urls.append(urljoin(url, img))
 
 
-def _merge(base: Product, extra: Product) -> Product:
+def merge(base: Product, extra: Product) -> Product:
     for attr in ("title", "description", "price", "brand", "site_name"):
         if not getattr(base, attr):
             setattr(base, attr, getattr(extra, attr))

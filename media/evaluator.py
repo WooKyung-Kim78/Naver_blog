@@ -108,11 +108,19 @@ def _split_tall(image: Image.Image, *, trigger: float = 2.5, panel_aspect: float
     if height <= width * trigger:
         return [image]
 
-    panel_height = int(width * panel_aspect)
-    count = min(max_panels, max(2, round(height / panel_height)))
-    step = height // count
+    panel_height = max(1, int(width * panel_aspect))
+    wanted = max(2, round(height / panel_height))
+    count = min(max_panels, wanted)
 
-    return [image.crop((0, i * step, width, min((i + 1) * step, height))) for i in range(count)]
+    if wanted <= max_panels:
+        step = height // count
+        return [image.crop((0, i * step, width, min((i + 1) * step, height))) for i in range(count)]
+
+    # 848x54000 처럼 패널 수보다 훨씬 긴 이미지는 균등 분할해도 한 장이 다시 길쭉해진다.
+    # 대신 읽기 좋은 높이의 창을 위아래로 고르게 흩어 뽑는다.
+    span = height - panel_height
+    offsets = [round(span * i / (count - 1)) for i in range(count)]
+    return [image.crop((0, top, width, top + panel_height)) for top in offsets]
 
 
 def dhash(image: Image.Image, size: int = 8) -> int:
