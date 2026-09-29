@@ -40,10 +40,23 @@ PAGE_BG = "#f8fafc"
 
 #: 윈도우 기본 한글 글꼴. 없으면 순서대로 다음 후보를 찾는다.
 FONT_CANDIDATES = {
-    "regular": ["malgun.ttf", "NanumGothic.ttf", "gulim.ttc", "arial.ttf"],
-    "bold": ["malgunbd.ttf", "NanumGothicBold.ttf", "gulim.ttc", "arialbd.ttf"],
+    "regular": [
+        "AppleSDGothicNeo.ttc", "AppleGothic.ttf", "malgun.ttf",
+        "NanumGothic.ttf", "gulim.ttc", "arial.ttf",
+    ],
+    "bold": [
+        "AppleSDGothicNeo.ttc", "AppleGothic.ttf", "malgunbd.ttf",
+        "NanumGothicBold.ttf", "gulim.ttc", "arialbd.ttf",
+    ],
 }
-FONT_DIRS = [Path(r"C:\Windows\Fonts"), Path("/usr/share/fonts"), Path("/Library/Fonts")]
+FONT_DIRS = [
+    Path("/System/Library/Fonts"),
+    Path("/System/Library/Fonts/Supplemental"),
+    Path.home() / "Library/Fonts",
+    Path(r"C:\Windows\Fonts"),
+    Path("/usr/share/fonts"),
+    Path("/Library/Fonts"),
+]
 
 PAD = 32  # 카드 바깥 여백
 GAP = 16  # 덩어리 사이 간격
@@ -191,7 +204,10 @@ def _load(path: Path | None, size: int) -> ImageFont.FreeTypeFont:
             return ImageFont.truetype(str(path), size * SCALE)
         except OSError:
             pass
-    return ImageFont.load_default(size * SCALE)
+    try:
+        return ImageFont.truetype("AppleSDGothicNeo.ttc", size * SCALE)
+    except OSError:
+        return ImageFont.load_default(size * SCALE)
 
 
 # ------------------------------------------------------------------ 배치

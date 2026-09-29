@@ -123,7 +123,11 @@
 글꼴은 윈도우 기본 맑은 고딕을 쓴다. 체크(✓)와 엑스(✕)는 맑은 고딕에 글리프가 없어
 두부(□)로 나오므로 선으로 직접 그린다.
 
-구매 링크는 세 곳에 들어간다. 주요 특징 뒤와 장점 뒤에 한 번씩, 마지막 한눈에 보기 뒤에 한 번.
+macOS에서는 시스템 한글 글꼴인 Apple SD Gothic Neo를 사용한다. 네이버 본문 입력은
+macOS의 Command+V, Windows의 Control+V로 붙여넣으며, 제목과 본문 텍스트가 실제로
+에디터에 들어갔는지 확인한 뒤 저장한다.
+
+구매 링크는 세 곳에 들어간다. 주요 특징 뒤와 장점 뒤에 한 번씩, 마지막 총평 뒤에 한 번.
 
 세 곳 모두 **쇼핑 커넥트 상품 카드**로 들어간다. 썸네일·상품명·판매처가 한 덩어리로
 보이는 그 카드다. 다만 만드는 방법이 출력물마다 다르다.
@@ -207,6 +211,24 @@
 
 ## 설치
 
+### macOS
+
+Python 3.10 이상이 필요하다. 터미널에서 프로젝트 폴더로 이동한 뒤 아래를 실행한다. `python3` 가 없다면 [python.org](https://www.python.org/downloads/macos/)에서 설치하거나, Homebrew가 설치되어 있을 때 `brew install python` 을 실행한다.
+
+```bash
+python3 --version
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+python -m playwright install chromium
+cp .env.example .env
+```
+
+`.env` 파일을 열어 아래 항목을 설정한다. VS Code에서는 `code .env`, 기본 텍스트 편집기에서는 `open -e .env` 로 열 수 있다. 새 터미널을 열 때마다 프로젝트 폴더에서 `source .venv/bin/activate` 를 실행한 다음 프로그램을 사용한다.
+
+### Windows (PowerShell)
+
 ```powershell
 cd c:\Temp\blog
 pip install -r requirements.txt
@@ -214,16 +236,25 @@ python -m playwright install chromium
 copy .env.example .env
 ```
 
-`.env` 에 아래 값을 채운다.
+`.env` 에 아래 값을 채운다. myGenAssist 를 사용할 수 없는 환경에서는 Google AI Studio에서 Gemini API 키를 발급받고, `.env` 의 제공자 값을 바꾼다.
+
+```dotenv
+AI_PROVIDER=gemini
+GEMINI_API_KEY=발급받은_API_키
+GEMINI_MODEL=gemini-3.8-flash
+```
+
+기본값은 `AI_PROVIDER=mygenassist` 이며 기존 myGenAssist 설정은 그대로 쓸 수 있다. Gemini 를 선택하면 프로그램은 Gemini 네이티브 API 를 사용하고, 비전 입력·JSON 응답·Google 검색 grounding 도 지원한다. 연결을 확인하려면 `python main.py doctor` 를 실행한다.
 
 | 항목 | 발급처 |
 | --- | --- |
-| `AI_API_KEY` | myGenAssist 웹 > 설정 > API Key |
+| `AI_API_KEY` | myGenAssist 웹 > 설정 > API Key (myGenAssist 선택 시) |
+| `GEMINI_API_KEY` | [Google AI Studio](https://aistudio.google.com/app/apikey) (Gemini 선택 시) |
 | `PEXELS_API_KEY` | https://www.pexels.com/api/ (무료) |
 | `NAVER_ID` / `NAVER_PW` / `NAVER_BLOG_ID` | 본인 네이버 계정 |
 | `NAVER_CREATOR_SPACE_ID` | 내 블로그의 쇼핑 커넥트 글에서 상품 카드를 검사하면 `data-linkdata` 안에 보인다 (선택) |
 
-```powershell
+```bash
 python main.py doctor
 ```
 
@@ -241,6 +272,34 @@ python main.py doctor
 내용과 이미지를 긁어올 실제 상품 판매 페이지 주소를 알려주세요.
 > https://brand.naver.com/finevu/products/13030260544
 ```
+
+### macOS
+
+터미널을 열고 프로젝트 폴더로 이동한다. 새 터미널을 열었거나 가상환경 표시가 보이지 않으면 먼저 가상환경을 활성화한다.
+
+```bash
+cd /경로/Naver_blog
+source .venv/bin/activate
+
+# 설정과 API 연결 점검
+python main.py doctor
+
+# 네이버에 올리지 않고 원고와 이미지만 생성하고 미리보기 열기
+python main.py post --url "https://구매링크" --dry-run --open
+
+# 실제 상품 페이지 주소를 지정해 리뷰 생성
+python main.py post --url "https://구매링크" --page-url "https://판매페이지"
+
+# 이미 만든 결과물을 업로드
+python main.py upload
+
+# 티스토리 로그인 정보를 처음 한 번 저장
+python main.py tistory-login
+```
+
+`/경로/Naver_blog` 는 실제 프로젝트 경로로 바꾼다. 설치 후에는 프로젝트 폴더에서 `source .venv/bin/activate` 를 먼저 실행한 뒤 `python main.py ...` 명령을 사용한다. Gemini를 선택했다면 `.env` 에 `AI_PROVIDER=gemini` 와 `GEMINI_API_KEY` 가 설정되어 있는지도 확인한다.
+
+### Windows (PowerShell)
 
 ```powershell
 # 원고와 이미지만 생성. HTML 미리보기까지 열기

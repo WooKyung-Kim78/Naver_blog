@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import re
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,6 +22,7 @@ from playwright.sync_api import FrameLocator, Page, TimeoutError as PlaywrightTi
 from config import SESSION_FILE, STORAGE_DIR, NaverConfig
 
 LOGIN_URL = "https://nid.naver.com/nidlogin.login?mode=form&url=https%3A%2F%2Fwww.naver.com"
+PASTE_SHORTCUT = "Meta+V" if sys.platform == "darwin" else "Control+V"
 
 # 네이버 로그인 페이지는 반응형이라 가로(row)/세로(column) 두 벌의 버튼이 함께 존재하고
 # 화면 폭에 따라 한쪽만 보인다. 패스키 버튼과 헷갈리지 않도록 id 를 먼저 시도한다.
@@ -44,11 +46,6 @@ IMAGE_BUTTON_SELECTORS = [
     "button.se-image-toolbar-button",
     "button[data-name='image']",
     ".se-toolbar-item-image button",
-]
-QUOTE_BUTTON_SELECTORS = [
-    "button.se-quotation-toolbar-button",
-    "button[data-name='quotation']",
-    ".se-toolbar-item-quotation button",
 ]
 DIVIDER_BUTTON_SELECTORS = [
     "button.se-horizontal-line-toolbar-button",
@@ -324,7 +321,7 @@ class NaverBlogPublisher:
         """네이버의 자동 입력 탐지를 피하려면 타이핑이 아닌 클립보드 붙여넣기를 써야 한다."""
         pyperclip.copy(value)
         page.click(selector)
-        page.keyboard.press("Control+V")
+        page.keyboard.press(PASTE_SHORTCUT)
         page.wait_for_timeout(400)
 
     # ------------------------------------------------------------------ 글쓰기
@@ -340,6 +337,7 @@ class NaverBlogPublisher:
 
         self._click_first(frame, TITLE_SELECTORS, "제목 입력란")
         self._paste_text(page, title)
+        self._verify_pasted_text(page, frame, TITLE_SELECTORS, title, "제목")
         page.wait_for_timeout(500)
 
         self._click_first(frame, BODY_SELECTORS, "본문 입력란")
@@ -354,10 +352,10 @@ class NaverBlogPublisher:
                 self._insert_quote(page, frame, block.value)
             elif block.kind == "product":
                 if not self._insert_product_card(page, frame, block.query):
-                    self._paste_text(page, block.value)
+                    self._paste_text(page, block.value, verify_scope=frame)
                     page.keyboard.press("Enter")
             else:
-                self._paste_text(page, block.value)
+                self._paste_text(page, block.value, verify_scope=frame)
                 page.keyboard.press("Enter")
                 size = _heading_size(block.value)
                 if size:
@@ -381,10 +379,49 @@ class NaverBlogPublisher:
             except (PlaywrightTimeout, PlaywrightError):
                 continue
 
-    def _paste_text(self, page: Page, text: str) -> None:
+    def _paste_text(self, page: Page, text: str, *, verify_scope: FrameLocator | None = None) -> None:
+        previous = self._editor_text(verify_scope, BODY_SELECTORS) if verify_scope else None
         pyperclip.copy(text)
-        page.keyboard.press("Control+V")
+        page.keyboard.press(PASTE_SHORTCUT)
         page.wait_for_timeout(500)
+        if verify_scope:
+            self._verify_pasted_text(page, verify_scope, BODY_SELECTORS, text, "본문", previous)
+
+    @staticmethod
+    def _editor_text(frame: FrameLocator, selectors: list[str]) -> str:
+        actual = ""
+        for selector in selectors:
+            try:
+                actual += "".join(frame.locator(selector).all_inner_texts())
+            except PlaywrightError:
+                continue
+        return re.sub(r"\s+", "", actual)
+
+    @staticmethod
+    def _verify_pasted_text(
+        page: Page,
+        frame: FrameLocator,
+        selectors: list[str],
+        text: str,
+        label: str,
+        previous: str | None = None,
+    ) -> None:
+        """붙여넣기가 실제 에디터에 반영되지 않으면 이미지뿐인 글 저장을 막는다."""
+        expected = re.sub(r"\s+", "", text)[:16]
+        if not expected:
+            return
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline:
+            actual = NaverBlogPublisher._editor_text(frame, selectors)
+            not_added = previous is not None and actual.count(expected) <= previous.count(expected)
+            if expected in actual and not not_added:
+                return
+            page.wait_for_timeout(250)
+
+        raise NaverBlogError(
+            f"{label} 텍스트를 붙여넣은 뒤 8초 안에 네이버 에디터에서 확인하지 못했습니다. "
+            "현재 글은 저장하지 않았습니다. 에디터 포커스를 확인한 뒤 다시 업로드해 주세요."
+        )
 
     def _emphasize_previous_line(self, page: Page, frame: FrameLocator, size: int) -> None:
         """방금 넣은 소제목 줄을 크고 굵게 바꾼다.
@@ -416,15 +453,9 @@ class NaverBlogPublisher:
         page.wait_for_timeout(200)
 
     def _insert_quote(self, page: Page, frame: FrameLocator, text: str) -> None:
-        """인용구 컴포넌트를 못 찾으면 기호를 붙인 일반 텍스트로 대신한다."""
-        if self._click_optional(frame, QUOTE_BUTTON_SELECTORS):
-            page.wait_for_timeout(600)
-            self._paste_text(page, text)
-            page.keyboard.press("Enter")
-            page.keyboard.press("Enter")  # 인용구 블록에서 빠져나온다
-        else:
-            self._paste_text(page, f"❝ {text} ❞")
-            page.keyboard.press("Enter")
+        """인용구 모드를 켜지 않고 일반 문단으로 넣어 다음 본문이 인용구에 붙는 것을 막는다."""
+        self._paste_text(page, f"❝ {text} ❞", verify_scope=frame)
+        page.keyboard.press("Enter")
 
     def _click_optional(self, scope: FrameLocator, selectors: list[str]) -> bool:
         """있으면 누르고 없으면 조용히 넘어간다. 서식 요소는 실패해도 글은 살아야 한다."""

@@ -52,8 +52,9 @@ def _get_int(key: str, default: int) -> int:
 
 @dataclass
 class AIConfig:
-    """Bayer myGenAssist API 접속 정보."""
+    """선택한 텍스트 AI 제공자에 접속하기 위한 설정."""
 
+    provider: str
     base_url: str
     api_key: str
     auth_header: str
@@ -66,18 +67,26 @@ class AIConfig:
 
     @property
     def url(self) -> str:
+        if self.provider == "gemini":
+            return f"{self.base_url.rstrip('/')}/models/{self.chat_model}:generateContent"
         path = "/chat/agent" if self.endpoint == "agent" else "/responses"
         return f"{self.base_url.rstrip('/')}{path}"
 
     def headers(self) -> dict[str, str]:
+        if self.provider == "gemini":
+            return {"Content-Type": "application/json", "x-goog-api-key": self.api_key}
         return {"Content-Type": "application/json", self.auth_header: self.api_key}
 
     def validate(self) -> None:
+        if self.provider not in ("mygenassist", "gemini"):
+            raise ConfigError("AI_PROVIDER 는 mygenassist 또는 gemini 여야 합니다.")
         if not self.base_url:
-            raise ConfigError("AI_BASE_URL 이 비어 있습니다. .env 를 확인하세요.")
+            raise ConfigError("AI API 주소가 비어 있습니다. .env 를 확인하세요.")
         if not self.api_key:
-            raise ConfigError("AI_API_KEY 가 비어 있습니다. myGenAssist 에서 API 키를 발급받아 .env 에 넣으세요.")
-        if self.endpoint not in ("agent", "responses"):
+            key_name = "GEMINI_API_KEY" if self.provider == "gemini" else "AI_API_KEY"
+            source = "Google AI Studio" if self.provider == "gemini" else "myGenAssist"
+            raise ConfigError(f"{key_name} 가 비어 있습니다. {source} 에서 API 키를 발급받아 .env 에 넣으세요.")
+        if self.provider == "mygenassist" and self.endpoint not in ("agent", "responses"):
             raise ConfigError("AI_ENDPOINT 는 agent 또는 responses 여야 합니다.")
 
 
@@ -197,14 +206,25 @@ def _proxies() -> dict[str, str]:
 
 
 def load_ai_config() -> AIConfig:
+    provider = _get("AI_PROVIDER", "mygenassist").lower()
+    is_gemini = provider == "gemini"
     return AIConfig(
-        base_url=_get("AI_BASE_URL", "https://chat.int.bayer.com/api/v3"),
-        api_key=_get("AI_API_KEY"),
+        provider=provider,
+        base_url=(
+            _get("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta")
+            if is_gemini
+            else _get("AI_BASE_URL", "https://chat.int.bayer.com/api/v3")
+        ),
+        api_key=_get("GEMINI_API_KEY" if is_gemini else "AI_API_KEY"),
         auth_header=_get("AI_AUTH_HEADER", "x-baychatgpt-accesstoken"),
         endpoint=_get("AI_ENDPOINT", "agent").lower(),
-        chat_model=_get("AI_CHAT_MODEL", "gpt-4o"),
+        chat_model=(
+            _get("GEMINI_MODEL", "gemini-3.8-flash")
+            if is_gemini
+            else _get("AI_CHAT_MODEL", "gpt-4o")
+        ),
         use_websearch=_get_bool("AI_USE_WEBSEARCH", True),
-        supports_json_mode=_get_bool("AI_SUPPORTS_JSON_MODE", True),
+        supports_json_mode=True if is_gemini else _get_bool("AI_SUPPORTS_JSON_MODE", True),
         verify_ssl=_get_bool("AI_VERIFY_SSL", True),
         proxies=_proxies(),
     )

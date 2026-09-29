@@ -1,4 +1,4 @@
-"""Bayer myGenAssist API 클라이언트.
+"""myGenAssist 및 Google Gemini API 클라이언트.
 
 docs/v3-api.yaml 기준:
   - POST /chat/agent : OpenAI chat/completions 호환. agent.tool_keys 로 websearch 사용 가능.
@@ -29,6 +29,8 @@ class AIError(RuntimeError):
 
 
 class MyGenAssistClient:
+    """공통 chat/chat_json 인터페이스를 제공한다 (이름은 기존 호출부 호환용)."""
+
     def __init__(self, cfg: AIConfig):
         cfg.validate()
         self.cfg = cfg
@@ -39,7 +41,13 @@ class MyGenAssistClient:
         self.session.verify = cfg.verify_ssl
 
     def ping(self) -> dict:
-        """토큰이 유효한지 /users/me 로 확인한다."""
+        """선택한 제공자의 인증 및 API 접근 가능 여부를 확인한다."""
+        if self.cfg.provider == "gemini":
+            resp = self.session.get(f"{self.cfg.base_url.rstrip('/')}/models", timeout=30)
+            if resp.status_code >= 400:
+                raise AIError(f"Gemini API 오류 {resp.status_code}: {resp.text[:800]}")
+            return resp.json()
+
         url = f"{self.cfg.base_url.rstrip('/')}/users/me"
         resp = self.session.get(url, timeout=30)
         if resp.status_code == 401:
@@ -61,18 +69,24 @@ class MyGenAssistClient:
         images: list[Path] | None = None,
         retries: int = 2,
     ) -> str:
-        payload = (
-            self._agent_payload(system, user, temperature, max_tokens, json_mode, websearch, images)
-            if self.cfg.endpoint == "agent"
-            else self._responses_payload(system, user, temperature, max_tokens, json_mode)
-        )
+        if self.cfg.provider == "gemini":
+            payload = self._gemini_payload(
+                system, user, temperature, max_tokens, json_mode, websearch, images
+            )
+        else:
+            payload = (
+                self._agent_payload(system, user, temperature, max_tokens, json_mode, websearch, images)
+                if self.cfg.endpoint == "agent"
+                else self._responses_payload(system, user, temperature, max_tokens, json_mode)
+            )
 
         last_error: Exception | None = None
         for attempt in range(retries + 1):
             try:
                 resp = self.session.post(self.cfg.url, json=payload, timeout=300)
                 if resp.status_code >= 400:
-                    raise AIError(f"API 오류 {resp.status_code}: {resp.text[:800]}")
+                    provider = "Gemini" if self.cfg.provider == "gemini" else "API"
+                    raise AIError(f"{provider} 오류 {resp.status_code}: {resp.text[:800]}")
                 return self._extract_text(resp.json())
             except (requests.RequestException, AIError) as exc:
                 last_error = exc
@@ -124,9 +138,89 @@ class MyGenAssistClient:
             payload["text"] = {"format": {"type": "json_object"}}
         return payload
 
+    def _gemini_payload(self, system, user, temperature, max_tokens, json_mode, websearch, images=None) -> dict:
+        parts: list[dict] = [{"text": user}]
+        for path in images or []:
+            data_uri = encode_image(path)
+            if data_uri:
+                mime_type, encoded = data_uri.split(",", 1)
+                parts.append({"inlineData": {"mimeType": mime_type[5:].split(";", 1)[0], "data": encoded}})
+
+        use_search = self.cfg.use_websearch if websearch is None else websearch
+        if json_mode and use_search:
+            # 실제 Gemini generateContent 시험에서 Google Search와
+            # responseMimeType=application/json을 함께 보내면 candidates 없이
+            # 응답하는 경우가 확인되어, 프롬프트 지시로 JSON 출력을 요청한다.
+            system += "\n\n응답은 유효한 JSON만 출력하고, 마크다운 코드펜스나 설명을 덧붙이지 마세요."
+        payload: dict = {
+            "systemInstruction": {"parts": [{"text": system}]},
+            "contents": [{"role": "user", "parts": parts}],
+            "generationConfig": {
+                "temperature": temperature,
+                # Gemini 3의 출력 한도에는 내부 사고 토큰도 포함되므로,
+                # 호출부가 요청한 예산의 2배를 주어 최종 답변 공간을 확보한다.
+                "maxOutputTokens": max_tokens * 2,
+            },
+        }
+        # Gemini Google Search와 JSON MIME 모드를 동시에 켰을 때 비어 있는
+        # candidates 응답이 재현되어, 검색 요청은 프롬프트 지시로 JSON을 요청한다.
+        model_version = re.match(r"gemini-(\d+)", self.cfg.chat_model)
+        supports_tool_json = bool(model_version and int(model_version.group(1)) >= 3)
+        if supports_tool_json:
+            # Gemini 3의 기본 thinking은 medium이며, 긴 집필 프롬프트에서는
+            # 출력 토큰 예산을 사고에 쓰고 최종 텍스트 없이 끝날 수 있다.
+            payload["generationConfig"]["thinkingConfig"] = {"thinkingLevel": "LOW"}
+        if json_mode and not use_search:
+            payload["generationConfig"]["responseMimeType"] = "application/json"
+        if use_search:
+            payload["tools"] = [{"googleSearch": {}}]
+        return payload
+
     @staticmethod
     def _extract_text(data: dict) -> str:
-        """chat/completions 와 Responses 두 응답 형식을 모두 처리한다."""
+        """Gemini, chat/completions, Responses 응답에서 텍스트를 추출한다."""
+        if isinstance(data.get("candidates"), list):
+            candidates = data["candidates"]
+            if candidates:
+                candidate = candidates[0]
+                content = candidate.get("content") or {}
+                text = "".join(
+                    part.get("text", "")
+                    for part in content.get("parts") or []
+                    if isinstance(part, dict) and not part.get("thought")
+                )
+                if text.strip():
+                    return text
+                if candidate.get("finishReason") == "MAX_TOKENS":
+                    usage = data.get("usageMetadata") or {}
+                    thoughts = usage.get("thoughtsTokenCount", 0)
+                    raise AIError(
+                        "Gemini가 출력 토큰 한도에 도달해 최종 답변을 만들지 못했습니다 "
+                        f"(사고 토큰 {thoughts}개). Gemini 3에서는 사고 토큰도 출력 한도에 포함됩니다. "
+                        "AI 호출을 다시 시도하거나 max_tokens 를 늘려주세요."
+                    )
+
+        feedback = data.get("promptFeedback") or {}
+        if feedback.get("blockReason"):
+            raise AIError(f"Gemini가 요청을 차단했습니다: {feedback['blockReason']}")
+
+        if "usageMetadata" in data and "candidates" not in data:
+            usage = data.get("usageMetadata") or {}
+            thoughts = usage.get("thoughtsTokenCount", 0)
+            candidate_tokens = usage.get("candidatesTokenCount", 0)
+            model = data.get("modelVersion", "unknown model")
+            response_id = data.get("responseId", "unavailable")
+            raise AIError(
+                f"Gemini({model})가 후보 답변 없이 종료했습니다 "
+                f"(사고 토큰 {thoughts}개, 답변 토큰 {candidate_tokens}개, 응답 ID {response_id}). "
+                "이 응답은 토큰 한도 초과를 단정할 수 없습니다. doctor 명령으로 API 연결을 확인하고, "
+                "반복되면 이 응답 ID와 함께 Gemini API 상태를 확인하세요."
+            )
+
+        if isinstance(data.get("error"), dict):
+            error = data["error"]
+            raise AIError(f"Gemini API 오류: {error.get('message') or json.dumps(error)[:800]}")
+
         if isinstance(data.get("choices"), list) and data["choices"]:
             choice = data["choices"][0]
             message = choice.get("message") or {}

@@ -121,14 +121,16 @@ def cmd_doctor() -> int:
     table = Table("항목", "상태", title="설정 점검", title_justify="left")
 
     ai_cfg = config.load_ai_config()
+    provider_name = "Gemini" if ai_cfg.provider == "gemini" else "myGenAssist"
     client = None
     try:
         ai_cfg.validate()
         client = MyGenAssistClient(ai_cfg)
         account = client.ping()
-        table.add_row("Bayer AI API", f"[green]연결 성공[/green] ({account.get('email') or '확인됨'})")
+        account_name = account.get("email") if isinstance(account, dict) else None
+        table.add_row(f"{provider_name} API", f"[green]연결 성공[/green] ({account_name or '인증 확인됨'})")
     except Exception as exc:
-        table.add_row("Bayer AI API", f"[red]실패[/red] {str(exc)[:140]}")
+        table.add_row(f"{provider_name} API", f"[red]실패[/red] {str(exc)[:140]}")
 
     if client:
         try:
