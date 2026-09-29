@@ -186,7 +186,7 @@ SLOT_PRODUCT = "product"  # 상품 소개
 SLOT_FEATURE = "feature"  # 주요 특징
 SLOT_LIFESTYLE = "lifestyle"  # 실사용 시나리오
 SLOT_INFOGRAPHIC = "infographic"  # 글 전체를 한 장으로 요약한 그림
-SLOT_CTA = "cta"  # 총평 및 CTA
+SLOT_CTA = "cta"  # 마지막 구매 안내
 
 #: 이미지 출처. 숫자가 작을수록 우선순위가 높다.
 #: infographic 은 우리가 직접 그린 것이라 사진과 경쟁시키지 않고 항상 먼저 쓴다.

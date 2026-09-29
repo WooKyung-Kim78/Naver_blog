@@ -85,9 +85,8 @@ _BACK_SCHEMA = """{
   "compare_rows": [["역할", "...", "..."], ["이런 때", "...", "..."]],
   "who_lead": "누구에게 맞는지 한 문장",
   "who_items": ["추천 대상", "3~4개"],
-  "summary_lead": "한눈에 보기 도입 한 문장. 아래 그림에 무엇이 정리돼 있는지 알려준다",
-  "verdict": "총평. 2문단. 세트로 살지, 골라 살지 분명히",
-  "summary_box": ["3줄 요약. 글 끝 인포그래픽에도 그대로 들어간다", "각 줄 35자 이내", "3개"],
+  "summary_lead": "한눈에 보기 도입 한 문장. 세트로 살지, 골라 살지 짧게 밝힌다",
+  "verdict": "총평. 공백 포함 500~1000자. 세트로 살지, 골라 살지 분명히. 인포그래픽에 그대로 들어간다",
   "cta": "마지막 안내. URL 쓰지 마라",
   "tags": ["태그", "# 없이 8~12개"]
 }"""
@@ -110,7 +109,7 @@ def analyze(
 - commonalities 는 모든 상품에 실제로 있는 점이어야 한다. 없으면 솔직히 적게 써라.
 - how_together 는 같이 쓰는 순서나 장면을 구체적으로. "잘 어울린다"는 쓰지 마라.
 - recommended_for 와 not_recommended_for 는 글 끝의 인포그래픽에 한 줄씩 그대로
-  들어간다. 길면 그림에서 두 줄로 넘어가므로 35자를 넘기지 마라.
+  들어간다. 길면 그림에서 잘리므로 25자를 넘기지 마라.
 
 아래 JSON 형식으로만 출력한다.
 
@@ -262,7 +261,10 @@ def write(
         WRITER_RULES,
         f"""{context}
 
-지금은 글의 뒷부분만 쓴다. 비교표, 추천 대상, 한눈에 보기, 총평이다.
+지금은 글의 뒷부분만 쓴다. 비교표, 추천 대상, 한눈에 보기다.
+
+- verdict 는 본문이 아니라 한눈에 보기 인포그래픽의 '총평' 칸에 들어간다. 공백 포함 500자 이상
+  1000자 이하로 쓴다. 번호나 목록 없이 문장으로만 쓴다.
 
 - compare_headers 첫 칸은 '구분', 나머지는 상품 짧은 이름. 상품 수는 {len(products)}개.
   예: ["구분", {short}]
@@ -361,12 +363,10 @@ def _assemble(
     add(KIND_HEADING, text=h2("한눈에", "한눈에 보기"), level=2)
     _add_paragraphs(blocks, back.get("summary_lead"))
     add(KIND_IMAGE, slot=SLOT_INFOGRAPHIC)
-
-    add(KIND_HEADING, text=h2("총평", "총평"), level=2)
-    _add_paragraphs(blocks, back.get("verdict"))
-    summary = _strs(back.get("summary_box"))
-    if summary:
-        add(KIND_CALLOUT, text="\n".join(summary), style="summary")
+    # 인포그래픽이 이 요약을 읽어 간다. 그림이 들어가면 pipeline 이 이 박스를 지운다.
+    verdict = _s(back.get("verdict"))
+    if verdict:
+        add(KIND_CALLOUT, text=verdict, style="summary")
 
     cta_text = _no_url(_s(back.get("cta"))) or "각 상품의 상세 정보와 구성은 판매 페이지에서 확인할 수 있다."
     add(KIND_PARAGRAPH, text=cta_text)

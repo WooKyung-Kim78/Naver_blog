@@ -35,7 +35,7 @@ CALLOUT_TITLE = {
     "info": "안내",
     "tip": "팁",
     "warn": "체크포인트",
-    "summary": "3줄 요약",
+    "summary": "총평",
 }
 
 

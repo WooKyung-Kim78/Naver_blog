@@ -27,7 +27,7 @@ from core.models import (
     SeoPlan,
 )
 
-CALLOUT_LABEL = {"info": "안내", "tip": "팁", "warn": "체크포인트", "summary": "3줄 요약"}
+CALLOUT_LABEL = {"info": "안내", "tip": "팁", "warn": "체크포인트", "summary": "총평"}
 
 STYLESHEET = """
 :root { --line:#e5e7eb; --ink:#1f2937; --muted:#6b7280; --accent:#03c75a; }

@@ -30,6 +30,7 @@ import config
 from ai import analyst, critic, focus as focus_mod, humanizer, reviser, roundup as roundup_mod, seo as seo_mod, writer
 from ai.client import MyGenAssistClient
 from core.models import (
+    KIND_CALLOUT,
     KIND_CTA,
     KIND_IMAGE,
     KIND_LINK,
@@ -665,7 +666,7 @@ class Pipeline:
         placed = planner.assign(
             [s for s in slots if s != SLOT_INFOGRAPHIC], available, brief, stock_query=_stock_query(brief, seo)
         )
-        self._draw_infographic(infographic.from_brief(product, brief, article), image_dir, placed)
+        self._draw_infographic(infographic.from_brief(product, brief, article), image_dir, placed, article)
 
         for block in article.blocks:
             if block.kind in (KIND_IMAGE, KIND_CTA) and block.slot in placed:
@@ -685,7 +686,11 @@ class Pipeline:
         return placed
 
     def _draw_infographic(
-        self, data: infographic.InfographicData, image_dir: Path, placed: dict[str, ImageAsset]
+        self,
+        data: infographic.InfographicData,
+        image_dir: Path,
+        placed: dict[str, ImageAsset],
+        article: Article,
     ) -> None:
         """글 전체 요약 그림을 그려 인포그래픽 슬롯에 꽂는다.
 
@@ -703,6 +708,10 @@ class Pipeline:
             return
         asset.slot = SLOT_INFOGRAPHIC
         placed[SLOT_INFOGRAPHIC] = asset
+        # 3줄 요약은 그림에 들어갔으니 글에서 같은 내용을 또 보여주지 않는다.
+        article.blocks = [
+            b for b in article.blocks if not (b.kind == KIND_CALLOUT and b.style == "summary")
+        ]
 
     def _place_roundup_images(
         self,
@@ -763,7 +772,7 @@ class Pipeline:
         leftovers = [a for a in available if a.phash is None or a.phash not in used]
         shared_placed = planner.assign(shared, leftovers, brief, stock_query=_stock_query(brief, seo))
         placed.update(shared_placed)
-        self._draw_infographic(infographic.from_roundup(combo, article), image_dir, placed)
+        self._draw_infographic(infographic.from_roundup(combo, article), image_dir, placed, article)
 
         for block in article.blocks:
             if block.kind in (KIND_IMAGE, KIND_CTA) and block.slot in placed:

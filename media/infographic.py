@@ -4,12 +4,13 @@ FAQ 를 글로 늘어놓으면 눈에 들어오지 않아서, 그 자리를 이 
 네이버 스마트에디터는 HTML 을 받지 않으므로 '한눈에 보이는 것' 을 본문에 넣으려면
 결국 이미지여야 한다. 그래서 HTML 로 꾸미지 않고 Pillow 로 직접 그린다.
 
-레이아웃은 세 덩어리다. 핵심 특징 / 이런 분께 / 3줄 요약. 내용 길이에 따라 세로로
-늘어나므로 높이는 그릴 때 계산한다.
+레이아웃은 네 덩어리다. 제목 배너 / 핵심 특징 아이콘 타일 / 이런 분께 / 총평.
+글은 줄 수를 정해 두고 넘치면 말줄임표로 자른다. 길어지면 한눈에 안 들어온다.
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -26,6 +27,8 @@ INK = "#1f2937"
 MUTED = "#6b7280"
 LINE = "#e5e7eb"
 ACCENT = "#03c75a"
+ACCENT_DARK = "#02a84b"
+ACCENT_SOFT = "#e7f9ef"
 GOOD = "#166534"
 GOOD_BG = "#f0fdf4"
 WARN = "#92400e"
@@ -43,12 +46,15 @@ FONT_CANDIDATES = {
 FONT_DIRS = [Path(r"C:\Windows\Fonts"), Path("/usr/share/fonts"), Path("/Library/Fonts")]
 
 PAD = 32  # 카드 바깥 여백
-GAP = 20  # 덩어리 사이 간격
+GAP = 16  # 덩어리 사이 간격
+RADIUS = 14
 
 
 #: 한 장에 담을 수 있는 한계. 넘기면 그림이 세로로 늘어져 한눈에 안 들어온다.
-MAX_FEATURES = 5
-MAX_AUDIENCE = 3
+MAX_FEATURES = 4
+MAX_AUDIENCE = 2
+#: 총평 글자 수 상한. 넘치면 마지막 문장 끝에서 자른다.
+MAX_VERDICT_CHARS = 1000
 
 
 @dataclass
@@ -92,11 +98,29 @@ def from_roundup(combo: RoundupBrief, article: Article) -> InfographicData:
 
 
 def summary_lines(article: Article) -> list[str]:
-    """원고의 3줄 요약 박스를 그대로 가져온다. 없으면 빈 목록."""
+    """원고의 총평 박스를 문단 목록으로 가져온다. 없으면 빈 목록."""
     for block in article.blocks:
         if block.kind == KIND_CALLOUT and block.style == "summary":
-            return [line.strip() for line in block.text.split("\n") if line.strip()]
+            return _limit_chars(
+                [line.strip() for line in block.text.split("\n") if line.strip()], MAX_VERDICT_CHARS
+            )
     return []
+
+
+def _limit_chars(paragraphs: list[str], limit: int) -> list[str]:
+    kept: list[str] = []
+    used = 0
+    for paragraph in paragraphs:
+        if used + len(paragraph) <= limit:
+            kept.append(paragraph)
+            used += len(paragraph)
+            continue
+        room = paragraph[: limit - used]
+        cut = max(room.rfind(". "), room.rfind("다."), room.rfind("? "), room.rfind("! "))
+        if cut > 0:
+            kept.append(room[: cut + 2].strip())
+        break
+    return kept
 
 
 def render(data: InfographicData, dest_dir: Path, *, name: str = "infographic.png") -> ImageAsset | None:
@@ -142,10 +166,12 @@ class _Fonts:
         regular = _find_font("regular")
         bold = _find_font("bold")
         self.head = _load(bold, 26)
-        self.section = _load(bold, 20)
+        self.section = _load(bold, 19)
         self.item = _load(bold, 17)
         self.body = _load(regular, 15)
         self.badge = _load(bold, 14)
+        self.pill = _load(bold, 13)
+        self.verdict = _load(regular, 16)
 
 
 def _find_font(weight: str) -> Path | None:
@@ -197,54 +223,76 @@ def _layout(data: InfographicData, fonts: _Fonts) -> list[_Block]:
 
 
 def _header_block(title: str, fonts: _Fonts, inner: int) -> _Block:
-    lines = _wrap(title, fonts.head, inner - 40)
-    height = 24 + len(lines) * _line_height(fonts.head) + 24
+    """초록 배너. '한눈에 보기' 딱지 아래에 상품명을 두 줄까지만 둔다."""
+    lines = _wrap(title, fonts.head, inner - 200, max_lines=2)
+    pill_h = 26
+    height = 26 + pill_h + 12 + len(lines) * _line_height(fonts.head) + 22
 
     def paint(draw: ImageDraw.ImageDraw, top: int) -> None:
-        _rect(draw, PAD, top, inner, height, CARD_BG)
-        # 왼쪽에 초록 띠를 둬서 본문 h2 와 같은 인상을 준다.
-        _rect(draw, PAD, top, 6, height, ACCENT)
-        y = top + 24
+        _round(draw, PAD, top, inner, height, ACCENT)
+        # 오른쪽에 겹친 원을 깔아 배너가 밋밋하지 않게 한다.
+        right = PAD + inner
+        _circle(draw, right - 70, top + height // 2, 58, ACCENT_DARK)
+        _circle(draw, right - 150, top + 30, 18, ACCENT_DARK)
+        _circle(draw, right - 70, top + height // 2, 30, "#ffffff")
+        _check(draw, right - 82, top + height // 2 - 10, ACCENT, size=2.2)
+
+        label = "한눈에 보기"
+        pill_w = int(draw.textlength(label, font=fonts.pill) / SCALE) + 28
+        _round(draw, PAD + 26, top + 26, pill_w, pill_h, "#ffffff", radius=13)
+        _text(draw, PAD + 40, top + 30, label, fonts.pill, ACCENT_DARK)
+
+        y = top + 26 + pill_h + 12
         for line in lines:
-            _text(draw, PAD + 26, y, line, fonts.head, INK)
+            _text(draw, PAD + 26, y, line, fonts.head, "#ffffff")
             y += _line_height(fonts.head)
 
     return _Block(height, paint)
 
 
 def _features_block(features: list[tuple[str, str]], label: str, fonts: _Fonts, inner: int) -> _Block:
-    text_left = 26 + 34  # 번호 배지 자리를 비운다
-    rows = []
-    for name, benefit in features:
-        name_lines = _wrap(name, fonts.item, inner - text_left - 26)
-        benefit_lines = _wrap(benefit, fonts.body, inner - text_left - 26) if benefit else []
-        rows.append((name_lines, benefit_lines))
+    """특징을 아이콘 타일 격자로 놓는다. 세 개면 한 줄, 그 외엔 두 칸이다."""
+    cols = 3 if len(features) == 3 else min(2, len(features))
+    gutter = 12
+    tile_w = (inner - gutter * (cols - 1)) // cols
+    icon = 44
+    name_w = tile_w - 18 - icon - 12 - 18
+    text_w = tile_w - 36
 
-    head_h = 24 + _line_height(fonts.section) + 16
-    row_heights = [
-        len(n) * _line_height(fonts.item) + (6 + len(b) * _line_height(fonts.body) if b else 0) + 18
-        for n, b in rows
+    tiles = [
+        (
+            _wrap(name, fonts.item, name_w, max_lines=2),
+            _wrap(benefit, fonts.body, text_w, max_lines=2) if benefit else [],
+        )
+        for name, benefit in features
     ]
-    height = head_h + sum(row_heights) + 10
+    tile_h = max(
+        18 + max(icon, len(n) * _line_height(fonts.item)) + (10 + len(b) * _line_height(fonts.body) if b else 0) + 18
+        for n, b in tiles
+    )
+    rows = math.ceil(len(tiles) / cols)
+    head_h = _section_head_height(fonts)
+    height = head_h + rows * tile_h + (rows - 1) * gutter
 
     def paint(draw: ImageDraw.ImageDraw, top: int) -> None:
-        _rect(draw, PAD, top, inner, height, CARD_BG)
-        _text(draw, PAD + 26, top + 24, label, fonts.section, INK)
-        y = top + head_h
-        for index, ((name_lines, benefit_lines), row_h) in enumerate(zip(rows, row_heights), 1):
-            _badge(draw, PAD + 26, y + 1, str(index), fonts.badge)
-            ty = y
+        _section_head(draw, PAD, top, label, fonts, INK, ACCENT)
+        for index, (name_lines, benefit_lines) in enumerate(tiles):
+            row, col = divmod(index, cols)
+            x = PAD + col * (tile_w + gutter)
+            y = top + head_h + row * (tile_h + gutter)
+            _round(draw, x, y, tile_w, tile_h, CARD_BG, outline=LINE)
+            _circle(draw, x + 18 + icon // 2, y + 18 + icon // 2, icon // 2, ACCENT_SOFT)
+            ICONS[index % len(ICONS)](draw, x + 18 + icon // 2, y + 18 + icon // 2, ACCENT)
+            name_h = len(name_lines) * _line_height(fonts.item)
+            ty = y + 18 + max(0, (icon - name_h) // 2)
             for line in name_lines:
-                _text(draw, PAD + text_left, ty, line, fonts.item, INK)
+                _text(draw, x + 18 + icon + 12, ty, line, fonts.item, INK)
                 ty += _line_height(fonts.item)
             if benefit_lines:
-                ty += 6
+                ty = y + 18 + max(icon, name_h) + 10
                 for line in benefit_lines:
-                    _text(draw, PAD + text_left, ty, line, fonts.body, MUTED)
+                    _text(draw, x + 18, ty, line, fonts.body, MUTED)
                     ty += _line_height(fonts.body)
-            y += row_h
-            if index < len(rows):
-                _rect(draw, PAD + text_left, y - 9, inner - text_left - 26, 1, LINE)
 
     return _Block(height, paint)
 
@@ -259,10 +307,11 @@ def _audience_block(good: list[str], bad: list[str], fonts: _Fonts, inner: int) 
         ("이런 분껜 비추천", bad, WARN, WARN_BG, _cross),
     ]
 
-    wrapped = [[_wrap(item, fonts.body, col_w - 56) for item in items] for _, items, *_ in columns]
-    head_h = 22 + _line_height(fonts.item) + 14
+    wrapped = [[_wrap(item, fonts.body, col_w - 62, max_lines=2) for item in items] for _, items, *_ in columns]
+    badge = 34
+    head_h = 20 + badge + 14
     col_heights = [
-        head_h + sum(len(lines) * _line_height(fonts.body) + 12 for lines in col) + 10
+        head_h + sum(len(lines) * _line_height(fonts.body) + 10 for lines in col) + 12
         for col in wrapped
     ]
     height = max(col_heights)
@@ -270,48 +319,122 @@ def _audience_block(good: list[str], bad: list[str], fonts: _Fonts, inner: int) 
     def paint(draw: ImageDraw.ImageDraw, top: int) -> None:
         for i, (label, _, ink, bg, mark) in enumerate(columns):
             x = PAD + i * (col_w + gutter)
-            _rect(draw, x, top, col_w, height, bg)
-            _text(draw, x + 22, top + 22, label, fonts.item, ink)
+            _round(draw, x, top, col_w, height, bg)
+            # 진한 원 안에 흰 체크/엑스를 넣어 좌우 대비가 멀리서도 보이게 한다.
+            cx, cy = x + 22 + badge // 2, top + 20 + badge // 2
+            _circle(draw, cx, cy, badge // 2, ink)
+            mark(draw, cx - 8, cy - 7, "#ffffff", size=1.4)
+            _text(draw, x + 22 + badge + 12, top + 20 + (badge - _line_height(fonts.item)) // 2 + 2, label, fonts.item, ink)
             y = top + head_h
             for lines in wrapped[i]:
-                mark(draw, x + 22, y + 5, ink)
+                mark(draw, x + 26, y + 5, ink)
                 for line in lines:
-                    _text(draw, x + 44, y, line, fonts.body, INK)
+                    _text(draw, x + 48, y, line, fonts.body, INK)
                     y += _line_height(fonts.body)
-                y += 12
+                y += 10
 
     return _Block(height, paint)
 
 
 def _summary_block(summary: list[str], fonts: _Fonts, inner: int) -> _Block:
-    wrapped = [_wrap(line, fonts.item, inner - 74) for line in summary]
-    head_h = 24 + _line_height(fonts.section) + 16
-    heights = [len(lines) * _line_height(fonts.item) + 14 for lines in wrapped]
-    height = head_h + sum(heights) + 10
+    """총평. 번호 없이 문단 그대로 넣는다."""
+    side = 26
+    wrapped = [_wrap(paragraph, fonts.verdict, inner - side * 2) for paragraph in summary]
+    head_h = 22 + _line_height(fonts.section) + 12
+    para_gap = 10
+    body_h = sum(len(lines) * _line_height(fonts.verdict) for lines in wrapped) + para_gap * (len(wrapped) - 1)
+    height = head_h + body_h + 22
 
     def paint(draw: ImageDraw.ImageDraw, top: int) -> None:
-        _rect(draw, PAD, top, inner, height, SUMMARY_BG)
-        _text(draw, PAD + 26, top + 24, "3줄 요약", fonts.section, SUMMARY_INK)
+        _round(draw, PAD, top, inner, height, SUMMARY_BG)
+        _pin(draw, PAD + side, top + 24, SUMMARY_INK)
+        _text(draw, PAD + side + 24, top + 22, "총평", fonts.section, SUMMARY_INK)
         y = top + head_h
-        for index, lines in enumerate(wrapped):
-            _badge(draw, PAD + 26, y + 1, str(index + 1), fonts.badge, fill=SUMMARY_INK)
-            ty = y
+        for lines in wrapped:
             for line in lines:
-                _text(draw, PAD + 60, ty, line, fonts.item, INK)
-                ty += _line_height(fonts.item)
-            y += heights[index]
+                _text(draw, PAD + side, y, line, fonts.verdict, INK)
+                y += _line_height(fonts.verdict)
+            y += para_gap
 
     return _Block(height, paint)
+
+
+def _section_head_height(fonts: _Fonts) -> int:
+    return _line_height(fonts.section) + 12
+
+
+def _section_head(draw: ImageDraw.ImageDraw, x: int, top: int, label: str, fonts: _Fonts, ink: str, bar: str) -> None:
+    """카드 밖에 놓는 소제목. 왼쪽 세로 띠는 본문 h2 와 같은 인상을 준다."""
+    _round(draw, x, top + 3, 5, _line_height(fonts.section) - 8, bar, radius=2)
+    _text(draw, x + 14, top, label, fonts.section, ink)
 
 
 # ------------------------------------------------------------------ 그리기 도구
 
 
-def _rect(draw: ImageDraw.ImageDraw, x: int, y: int, w: int, h: int, color: str) -> None:
-    draw.rectangle(
+def _round(
+    draw: ImageDraw.ImageDraw,
+    x: int,
+    y: int,
+    w: int,
+    h: int,
+    color: str,
+    *,
+    radius: int = RADIUS,
+    outline: str | None = None,
+) -> None:
+    draw.rounded_rectangle(
         [x * SCALE, y * SCALE, (x + w) * SCALE - 1, (y + h) * SCALE - 1],
+        radius=radius * SCALE,
         fill=color,
+        outline=outline,
+        width=SCALE if outline else 0,
     )
+
+
+def _circle(draw: ImageDraw.ImageDraw, cx: float, cy: float, r: float, color: str) -> None:
+    draw.ellipse([(cx - r) * SCALE, (cy - r) * SCALE, (cx + r) * SCALE, (cy + r) * SCALE], fill=color)
+
+
+def _poly(draw: ImageDraw.ImageDraw, points: list[tuple[float, float]], color: str) -> None:
+    draw.polygon([(px * SCALE, py * SCALE) for px, py in points], fill=color)
+
+
+# 아이콘은 글꼴 글리프가 없어도 나오도록 도형으로 직접 그린다. (cx, cy) 가 중심이다.
+
+
+def _icon_star(draw: ImageDraw.ImageDraw, cx: float, cy: float, color: str) -> None:
+    points = []
+    for i in range(10):
+        r = 12 if i % 2 == 0 else 5
+        angle = math.pi / 2 + i * math.pi / 5
+        points.append((cx + r * math.cos(angle), cy - r * math.sin(angle)))
+    _poly(draw, points, color)
+
+
+def _icon_bolt(draw: ImageDraw.ImageDraw, cx: float, cy: float, color: str) -> None:
+    _poly(draw, [(cx + 3, cy - 13), (cx - 8, cy + 2), (cx - 1, cy + 2), (cx - 3, cy + 13), (cx + 8, cy - 2), (cx + 1, cy - 2)], color)
+
+
+def _icon_diamond(draw: ImageDraw.ImageDraw, cx: float, cy: float, color: str) -> None:
+    _poly(draw, [(cx - 12, cy - 4), (cx - 6, cy - 10), (cx + 6, cy - 10), (cx + 12, cy - 4), (cx, cy + 12)], color)
+    draw.line([((cx - 12) * SCALE, (cy - 4) * SCALE), ((cx + 12) * SCALE, (cy - 4) * SCALE)], fill="#ffffff", width=SCALE)
+
+
+def _icon_heart(draw: ImageDraw.ImageDraw, cx: float, cy: float, color: str) -> None:
+    _circle(draw, cx - 5.5, cy - 4, 6.5, color)
+    _circle(draw, cx + 5.5, cy - 4, 6.5, color)
+    _poly(draw, [(cx - 11.8, cy - 1.5), (cx + 11.8, cy - 1.5), (cx, cy + 11)], color)
+
+
+ICONS = [_icon_star, _icon_bolt, _icon_diamond, _icon_heart]
+
+
+def _pin(draw: ImageDraw.ImageDraw, x: int, y: int, color: str) -> None:
+    """총평 제목 옆 핀 모양."""
+    _circle(draw, x + 8, y + 7, 7, color)
+    _poly(draw, [(x + 2, y + 10), (x + 14, y + 10), (x + 8, y + 20)], color)
+    _circle(draw, x + 8, y + 7, 2.5, "#ffffff")
 
 
 def _text(draw: ImageDraw.ImageDraw, x: int, y: int, value: str, font, color: str) -> None:
@@ -333,21 +456,28 @@ def _badge(draw: ImageDraw.ImageDraw, x: int, y: int, label: str, font, fill: st
     )
 
 
-def _check(draw: ImageDraw.ImageDraw, x: int, y: int, color: str) -> None:
+def _check(draw: ImageDraw.ImageDraw, x: int, y: int, color: str, *, size: float = 1.0) -> None:
     draw.line(
-        [(x * SCALE, (y + 5) * SCALE), ((x + 4) * SCALE, (y + 9) * SCALE), ((x + 11) * SCALE, y * SCALE)],
+        [
+            (x * SCALE, (y + 5 * size) * SCALE),
+            ((x + 4 * size) * SCALE, (y + 9 * size) * SCALE),
+            ((x + 11 * size) * SCALE, y * SCALE),
+        ],
         fill=color,
-        width=2 * SCALE,
+        width=round(2 * size * SCALE),
         joint="curve",
     )
 
 
-def _cross(draw: ImageDraw.ImageDraw, x: int, y: int, color: str) -> None:
+def _cross(draw: ImageDraw.ImageDraw, x: int, y: int, color: str, *, size: float = 1.0) -> None:
     for start, end in (((0, 0), (10, 10)), ((10, 0), (0, 10))):
         draw.line(
-            [((x + start[0]) * SCALE, (y + start[1]) * SCALE), ((x + end[0]) * SCALE, (y + end[1]) * SCALE)],
+            [
+                ((x + start[0] * size) * SCALE, (y + start[1] * size) * SCALE),
+                ((x + end[0] * size) * SCALE, (y + end[1] * size) * SCALE),
+            ],
             fill=color,
-            width=2 * SCALE,
+            width=round(2 * size * SCALE),
         )
 
 
@@ -355,8 +485,8 @@ def _line_height(font) -> int:
     return int(font.size / SCALE * 1.5)
 
 
-def _wrap(text: str, font, max_width: int) -> list[str]:
-    """픽셀 너비로 줄을 나눈다.
+def _wrap(text: str, font, max_width: int, *, max_lines: int = 0) -> list[str]:
+    """픽셀 너비로 줄을 나눈다. max_lines 를 넘기면 마지막 줄 끝을 말줄임표로 자른다.
 
     한국어는 띄어쓰기가 드물어 단어 단위로만 자르면 한 줄이 넘쳐 잘린다.
     그래서 띄어쓰기를 먼저 시도하고, 한 덩어리가 너무 길면 글자 단위로 쪼갠다.
@@ -386,4 +516,10 @@ def _wrap(text: str, font, max_width: int) -> list[str]:
                 current = char
     if current:
         lines.append(current)
+    if max_lines and len(lines) > max_lines:
+        lines = lines[:max_lines]
+        last = lines[-1]
+        while last and font.getlength(last + "…") > limit:
+            last = last[:-1]
+        lines[-1] = last.rstrip() + "…"
     return lines

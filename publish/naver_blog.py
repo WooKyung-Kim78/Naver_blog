@@ -60,6 +60,18 @@ SHOPPING_CONNECT_BUTTON_SELECTORS = [
     "button[data-name='shopping-connect']",
     ".se-toolbar-item-shopping-connect button",
 ]
+FONT_SIZE_BUTTON_SELECTORS = [
+    "button.se-font-size-code-toolbar-button",
+    "button[data-name='font-size']",
+    ".se-toolbar-item-font-size-code button",
+]
+BOLD_BUTTON_SELECTORS = [
+    "button.se-bold-toolbar-button",
+    "button[data-name='bold']",
+    ".se-toolbar-item-bold button",
+]
+#: 소제목 글자 크기. 스마트에디터 본문 기본은 15 다. render/naver_blocks.py 의 기호와 짝이다.
+HEADING_SIZES = {"■ ": 24, "▸ ": 19}
 #: 쇼핑 커넥트 팝업 내부. 상품을 검색해서 고르고 '추가하기' 로 확인하는 3단계다.
 SHOPPING_CONNECT_POPUP = ".se-popup-shopping-connect"
 SHOPPING_CONNECT_SEARCH_INPUT = "input.se-popup-search-input"
@@ -347,6 +359,9 @@ class NaverBlogPublisher:
             else:
                 self._paste_text(page, block.value)
                 page.keyboard.press("Enter")
+                size = _heading_size(block.value)
+                if size:
+                    self._emphasize_previous_line(page, frame, size)
             page.wait_for_timeout(700)
 
         self._snap("content_filled")
@@ -370,6 +385,35 @@ class NaverBlogPublisher:
         pyperclip.copy(text)
         page.keyboard.press("Control+V")
         page.wait_for_timeout(500)
+
+    def _emphasize_previous_line(self, page: Page, frame: FrameLocator, size: int) -> None:
+        """방금 넣은 소제목 줄을 크고 굵게 바꾼다.
+
+        Enter 로 다음 줄을 먼저 만든 뒤 서식을 입히므로, 다음 본문은 서식을 물려받지 않는다.
+        툴바를 못 찾으면 서식 없이 넘어간다. 글은 이미 들어갔다.
+        """
+        editor = page.frame(name="mainFrame") or page.main_frame
+        try:
+            selected = editor.evaluate(_SELECT_PREVIOUS_PARAGRAPH_JS)
+        except PlaywrightError:
+            selected = False
+        if not selected:
+            return
+        page.wait_for_timeout(200)
+
+        if self._click_optional(frame, FONT_SIZE_BUTTON_SELECTORS):
+            page.wait_for_timeout(300)
+            if not self._click_optional(frame, _font_size_options(size)):
+                page.keyboard.press("Escape")
+        if not self._click_optional(frame, BOLD_BUTTON_SELECTORS):
+            page.keyboard.press("Control+B")
+        page.wait_for_timeout(200)
+
+        try:
+            editor.evaluate(_RETURN_TO_NEXT_PARAGRAPH_JS)
+        except PlaywrightError:
+            page.keyboard.press("ArrowDown")
+        page.wait_for_timeout(200)
 
     def _insert_quote(self, page: Page, frame: FrameLocator, text: str) -> None:
         """인용구 컴포넌트를 못 찾으면 기호를 붙인 일반 텍스트로 대신한다."""
@@ -564,6 +608,58 @@ class NaverBlogPublisher:
             self.page.screenshot(path=str(shot_dir / f"{int(time.time())}_{name}.png"), full_page=True)
         except PlaywrightError:
             pass
+
+
+def _heading_size(value: str) -> int:
+    """소제목 기호로 시작하는 한 줄짜리 텍스트면 그 글자 크기를, 아니면 0."""
+    text = (value or "").strip()
+    if "\n" in text:
+        return 0
+    for mark, size in HEADING_SIZES.items():
+        if text.startswith(mark):
+            return size
+    return 0
+
+
+def _font_size_options(size: int) -> list[str]:
+    return [
+        f"button.se-toolbar-option-font-size-code-fs{size}-button",
+        f".se-toolbar-option-font-size-code-fs{size}-button",
+        f"button[data-value='fs{size}']",
+    ]
+
+
+# 커서가 있는 빈 줄 바로 위 문단(소제목)을 통째로 선택한다. 돌아올 자리는 window 에 기억해 둔다.
+_SELECT_PREVIOUS_PARAGRAPH_JS = """() => {
+    const sel = window.getSelection();
+    if (!sel || !sel.anchorNode) return false;
+    const start = sel.anchorNode.nodeType === 1 ? sel.anchorNode : sel.anchorNode.parentElement;
+    const current = start && start.closest('.se-text-paragraph');
+    if (!current) return false;
+    const all = Array.from(document.querySelectorAll('.se-text-paragraph'));
+    const index = all.indexOf(current);
+    if (index < 1) return false;
+    const prev = all[index - 1];
+    if (!prev.textContent.trim()) return false;
+    window.__seHeadingNext = current;
+    const range = document.createRange();
+    range.selectNodeContents(prev);
+    sel.removeAllRanges();
+    sel.addRange(range);
+    return true;
+}"""
+
+_RETURN_TO_NEXT_PARAGRAPH_JS = """() => {
+    const next = window.__seHeadingNext;
+    if (!next || !next.isConnected) throw new Error('next paragraph gone');
+    const range = document.createRange();
+    range.selectNodeContents(next);
+    range.collapse(false);
+    const sel = window.getSelection();
+    sel.removeAllRanges();
+    sel.addRange(range);
+    return true;
+}"""
 
 
 def _search_terms(title: str) -> list[str]:

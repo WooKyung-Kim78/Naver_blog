@@ -69,7 +69,7 @@ def plan(
             f"[조합 테마] {theme or brief.category}\n"
         )
         structure = (
-            "공통점 / 같이 쓰는 장면 / 상품소개 / 비교 / 추천대상 / 한눈에 보기 / 총평"
+            "공통점 / 같이 쓰는 장면 / 상품소개 / 비교 / 추천대상 / 한눈에 보기"
         )
     else:
         opener = (
@@ -78,7 +78,7 @@ def plan(
             "키워드 전략을 세워라.\n\n"
             f"[상품] {product.title}\n"
         )
-        structure = "문제제기 / 상품소개 / 주요특징 / 실사용 / 장점 / 아쉬운점 / 한눈에 보기 / 총평"
+        structure = "문제제기 / 상품소개 / 주요특징 / 실사용 / 장점 / 아쉬운점 / 한눈에 보기"
 
     user = f"""{opener}[카테고리] {brief.category}
 [한 줄 요약] {brief.one_liner}

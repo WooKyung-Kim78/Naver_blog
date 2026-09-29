@@ -88,8 +88,7 @@ class TistoryPublisher:
     def ensure_login(self) -> None:
         """관리 화면이 열려야 로그인한 것이다. 쿠키만 보고 넘어가지 않는다."""
         page = self.page
-        page.goto(f"{self.cfg.home}/manage/posts/", wait_until="domcontentloaded")
-        page.wait_for_timeout(2000)
+        self._goto_admin()
         if self._admin_open():
             self._mark_logged_in()
             return
@@ -110,9 +109,8 @@ class TistoryPublisher:
         except EOFError:
             pass
 
-        page.goto(f"{self.cfg.home}/manage/posts/", wait_until="domcontentloaded")
-        page.wait_for_timeout(2000)
         self._adopt_newest_page()
+        self._goto_admin()
         if not self._admin_open():
             raise TistoryError(
                 "티스토리 로그인에 실패했습니다. 관리 글 목록이 열리지 않았습니다.\n"
@@ -120,6 +118,23 @@ class TistoryPublisher:
                 "카카오 로그인과 2단계 인증을 끝낸 뒤 python main.py tistory-login 을 다시 실행하세요."
             )
         self._mark_logged_in()
+
+    def _goto_admin(self) -> None:
+        """로그인 직후 리다이렉트가 끝나지 않아 이동이 끊기면 기다렸다가 다시 연다."""
+        url = f"{self.cfg.home}/manage/posts/"
+        for attempt in range(3):
+            try:
+                self.page.goto(url, wait_until="domcontentloaded")
+                break
+            except PlaywrightError as exc:
+                if "interrupted by another navigation" not in str(exc) or attempt == 2:
+                    raise
+                try:
+                    self.page.wait_for_load_state("load", timeout=10_000)
+                except PlaywrightError:
+                    pass
+                self.page.wait_for_timeout(1500)
+        self.page.wait_for_timeout(2000)
 
     def _click_kakao_login(self) -> None:
         for selector in (
