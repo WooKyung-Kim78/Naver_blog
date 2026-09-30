@@ -23,6 +23,31 @@ from core.models import KIND_CTA, KIND_LINK, Article, Product, ProductCard
 #: 에디터가 카드를 만들 때 붙이는 유입경로 표시. affiliateUrl 에는 들어가지 않는다.
 _EDITOR_PARAM = "ac"
 
+PLATFORM_NAVER = "naver"
+PLATFORM_TOSS = "toss"
+
+#: 토스쇼핑 쉐어링크 글 상단에 회색으로 넣는 대가성 문구.
+TOSS_DISCLOSURE = "[광고] 토스쇼핑 쉐어링크 활동으로, 링크 구매 시 수수료를 지급받습니다."
+
+
+def platform(url: str) -> str:
+    """링크 도메인으로 제휴 플랫폼을 가린다. 모르는 도메인이면 빈 문자열."""
+    host = urlparse(url or "").netloc.lower()
+    if "naver" in host:
+        return PLATFORM_NAVER
+    if "toss" in host:
+        return PLATFORM_TOSS
+    return ""
+
+
+def is_toss(url: str) -> bool:
+    return platform(url) == PLATFORM_TOSS
+
+
+def disclosure_for(urls: list[str], default: str) -> str:
+    """토스 링크가 하나라도 있으면 토스 문구를, 아니면 기본 문구를 쓴다."""
+    return TOSS_DISCLOSURE if any(is_toss(u) for u in urls) else default
+
 
 def build(product: Product, creator_space_id: str = "") -> ProductCard:
     """상품 하나에 대한 카드 정보를 만든다."""
@@ -52,11 +77,16 @@ def attach(article: Article, products: list[Product], creator_space_id: str = ""
     if not products:
         return
 
-    cards = {p.url: build(p, creator_space_id) for p in products if p.url}
-    fallback = build(products[0], creator_space_id) if len(products) == 1 else None
+    # 토스 링크는 쇼핑 커넥트 카드가 아니라 일반 링크로 넣는다.
+    cards = {p.url: build(p, creator_space_id) for p in products if p.url and not is_toss(p.url)}
+    single = products[0] if len(products) == 1 else None
+    fallback = build(single, creator_space_id) if single and not is_toss(single.url) else None
 
     for block in article.blocks:
         if block.kind not in (KIND_LINK, KIND_CTA):
+            continue
+        if is_toss(block.href):
+            block.card = None
             continue
         card = cards.get(block.href) or fallback
         if not card:

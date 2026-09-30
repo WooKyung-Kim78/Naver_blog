@@ -542,7 +542,8 @@ class Pipeline:
                 self.report(f"원고 집필 중 (시도 {attempt}/{self.quality_cfg.max_attempts})")
                 article = writer.write(
                     self.client, product, brief, seo,
-                    self.post_cfg.persona, self.post_cfg.disclosure,
+                    self.post_cfg.persona,
+                    shopping_connect.disclosure_for([product.url], self.post_cfg.disclosure),
                     focus=focus,
                 )
             else:
@@ -599,7 +600,9 @@ class Pipeline:
                 self.report(f"묶음 원고 집필 중 (시도 {attempt}/{self.quality_cfg.max_attempts})")
                 article = roundup_mod.write(
                     self.client, products, briefs, combo, seo,
-                    self.post_cfg.persona, self.post_cfg.disclosure, focus=focus,
+                    self.post_cfg.persona,
+                    shopping_connect.disclosure_for([p.url for p in products], self.post_cfg.disclosure),
+                    focus=focus,
                 )
             else:
                 self.report(f"지적 사항 수정 중 (시도 {attempt}/{self.quality_cfg.max_attempts})")

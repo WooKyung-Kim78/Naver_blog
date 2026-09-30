@@ -22,6 +22,7 @@ from core.models import (
     KIND_TABLE,
     Article,
 )
+from core.shopping_connect import PLATFORM_NAVER, TOSS_DISCLOSURE, is_toss, platform
 
 RULE = "─" * 22
 
@@ -43,20 +44,26 @@ CALLOUT_TITLE = {
 class Op:
     """에디터에 순서대로 적용할 조작.
 
-    kind 는 text / image / quote / divider / product.
+    kind 는 text / image / quote / divider / product / link / notice.
 
     product 는 툴바의 '쇼핑커넥트' 버튼으로 넣는 상품 카드다. 에디터가 제휴 링크를
     직접 발급하므로 우리가 넘기는 건 어느 상품인지 찾을 검색어뿐이다. 상품을 못
     찾았을 때를 대비해 지금까지 쓰던 텍스트 링크를 value 에 함께 들려 보낸다.
+
+    link 는 툴바의 '링크' 버튼으로 넣는 링크 카드다(토스 등). query 가 주소다.
+    notice 는 회색 글씨로 넣는 한 줄짜리 안내다.
     """
 
     kind: str
     value: str = ""
-    query: str = ""  # product 전용. 에디터에서 상품을 찾을 검색어
+    query: str = ""  # product: 에디터에서 상품을 찾을 검색어, link: 링크 주소
 
 
 def render(article: Article) -> list[Op]:
     ops: list[Op] = []
+    hrefs = [b.href for b in article.blocks if b.kind in (KIND_LINK, KIND_CTA) and b.href]
+    has_toss = any(is_toss(h) for h in hrefs)
+    has_naver = any(platform(h) == PLATFORM_NAVER for h in hrefs)
 
     def text(value: str) -> None:
         if value.strip():
@@ -76,6 +83,13 @@ def render(article: Article) -> list[Op]:
             ops.append(Op("quote", block.text))
 
         elif kind == KIND_CALLOUT:
+            if _is_disclosure(block, article):
+                if has_toss:
+                    ops.append(Op("notice", TOSS_DISCLOSURE))
+                    continue
+                if has_naver:
+                    # 쇼핑 커넥트 글에는 네이버가 대가성 문구를 자동으로 붙인다.
+                    continue
             mark = CALLOUT_MARK.get(block.style, "ℹ️")
             title = CALLOUT_TITLE.get(block.style, "안내")
             lines = [l for l in block.text.split("\n") if l.strip()]
@@ -111,12 +125,18 @@ def render(article: Article) -> list[Op]:
     return ops
 
 
+def _is_disclosure(block, article: Article) -> bool:
+    return bool(article.disclosure) and block.text.strip() == article.disclosure.strip()
+
+
 def _buy_link(block, fallback: str) -> Op:
-    """상품 카드로 넣을 수 있으면 카드로, 아니면 예전처럼 텍스트 링크로.
+    """토스는 링크 카드로, 상품 카드로 넣을 수 있으면 카드로, 아니면 예전처럼 텍스트 링크로.
 
     카드에 상품명이 없으면 에디터에서 찾을 방법이 없으므로 텍스트 링크로 둔다.
     네이버 에디터는 줄 단독으로 놓인 URL 을 자동으로 링크로 바꿔 준다.
     """
+    if is_toss(block.href):
+        return Op("link", fallback, query=block.href)
     if block.card and block.card.title:
         return Op("product", fallback, query=block.card.title)
     return Op("text", fallback)
@@ -125,11 +145,11 @@ def _buy_link(block, fallback: str) -> Op:
 def dump(ops: list[Op]) -> str:
     """naver.txt 로 남길 사람이 읽는 형태.
 
-    product 는 첫 줄이 검색어이고 나머지가 실패했을 때 쓸 텍스트다.
+    product/link 는 첫 줄이 검색어(또는 주소)이고 나머지가 실패했을 때 쓸 텍스트다.
     """
     chunks = []
     for op in ops:
-        head = f"[{op.kind}] {op.query}\n{op.value}" if op.kind == "product" else f"[{op.kind}] {op.value}"
+        head = f"[{op.kind}] {op.query}\n{op.value}" if op.kind in ("product", "link") else f"[{op.kind}] {op.value}"
         chunks.append(head.rstrip())
     return "\n\n".join(chunks)
 

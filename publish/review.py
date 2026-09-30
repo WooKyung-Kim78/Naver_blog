@@ -69,7 +69,7 @@ def rebuild_from_notes(
         article,
         notes,
         persona=post_cfg.persona,
-        disclosure=post_cfg.disclosure,
+        disclosure=article.disclosure or post_cfg.disclosure,
         seo=seo,
     )
     dest = run_dir / SUGGESTIONS_FILE

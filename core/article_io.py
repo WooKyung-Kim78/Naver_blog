@@ -70,7 +70,7 @@ def article_from_ops(title: str, tags: list[str], payload: list[PostBlock], disc
         if op.kind == "image":
             image = ImageAsset(source="detail", path=Path(op.value) if op.value else None)
             nxt = payload[i + 1] if i + 1 < len(payload) else None
-            if nxt and nxt.kind in ("text", "product") and "👉" in nxt.value and _URL_RE.search(nxt.value):
+            if nxt and nxt.kind in ("text", "product", "link") and "👉" in nxt.value and _URL_RE.search(nxt.value):
                 href = _first_url(nxt.value)
                 text = _link_label(nxt.value)
                 kind = KIND_CTA if "─" in nxt.value else KIND_LINK
@@ -90,6 +90,9 @@ def article_from_ops(title: str, tags: list[str], payload: list[PostBlock], disc
             blocks.append(Block(kind=KIND_QUOTE, text=op.value))
         elif op.kind == "divider":
             blocks.append(Block(kind=KIND_DIVIDER))
+        elif op.kind == "notice":
+            blocks.append(Block(kind=KIND_CALLOUT, text=op.value, style="info"))
+            disclosure = op.value
         else:
             block = _text_block(op.value, disclosure)
             if block.kind == KIND_LINK:

@@ -67,6 +67,28 @@ BOLD_BUTTON_SELECTORS = [
     "button[data-name='bold']",
     ".se-toolbar-item-bold button",
 ]
+FONT_COLOR_BUTTON_SELECTORS = [
+    "button.se-font-color-toolbar-button",
+    "button[data-name='font-color']",
+    ".se-toolbar-item-font-color button",
+]
+#: 글씨색 팔레트의 회색 후보. 여러 값 중 화면에 있는 첫 번째를 누른다.
+GRAY_COLOR_SELECTORS = [
+    ", ".join(
+        f"button[data-color='{c}' i]"
+        for c in ("#8a8a8a", "#888888", "#999999", "#777777", "#aaaaaa", "#bbbbbb")
+    ),
+]
+#: 툴바의 '링크'. 주소를 넣고 검색하면 미리보기 카드가 만들어진다.
+LINK_BUTTON_SELECTORS = [
+    "button.se-oglink-toolbar-button",
+    "button[data-name='oglink']",
+    ".se-toolbar-item-oglink button",
+]
+LINK_POPUP = ".se-popup-oglink"
+LINK_INPUT = "input.se-popup-oglink-input"
+LINK_SEARCH_BUTTON = "button.se-popup-oglink-button"
+LINK_COMPONENT = ".se-component.se-oglink"
 #: 소제목 글자 크기. 스마트에디터 본문 기본은 15 다. render/naver_blocks.py 의 기호와 짝이다.
 HEADING_SIZES = {"■ ": 24, "▸ ": 19}
 #: 쇼핑 커넥트 팝업 내부. 상품을 검색해서 고르고 '추가하기' 로 확인하는 3단계다.
@@ -91,9 +113,9 @@ class NaverBlogError(RuntimeError):
 
 @dataclass
 class PostBlock:
-    kind: str  # text / image / quote / divider / product
-    value: str = ""  # 텍스트 내용, 이미지 파일 경로, 또는 상품 카드 실패 시 쓸 텍스트
-    query: str = ""  # product 전용. 쇼핑 커넥트에서 상품을 찾을 검색어
+    kind: str  # text / image / quote / divider / product / link / notice
+    value: str = ""  # 텍스트 내용, 이미지 파일 경로, 또는 카드 실패 시 쓸 텍스트
+    query: str = ""  # product: 쇼핑 커넥트에서 상품을 찾을 검색어, link: 링크 주소
 
 
 class NaverBlogPublisher:
@@ -354,6 +376,14 @@ class NaverBlogPublisher:
                 if not self._insert_product_card(page, frame, block.query):
                     self._paste_text(page, block.value, verify_scope=frame)
                     page.keyboard.press("Enter")
+            elif block.kind == "link":
+                if not self._insert_link_card(page, frame, block.query):
+                    self._paste_text(page, block.value, verify_scope=frame)
+                    page.keyboard.press("Enter")
+            elif block.kind == "notice":
+                self._paste_text(page, block.value, verify_scope=frame)
+                page.keyboard.press("Enter")
+                self._gray_previous_line(page, frame)
             else:
                 self._paste_text(page, block.value, verify_scope=frame)
                 page.keyboard.press("Enter")
@@ -429,14 +459,9 @@ class NaverBlogPublisher:
         Enter 로 다음 줄을 먼저 만든 뒤 서식을 입히므로, 다음 본문은 서식을 물려받지 않는다.
         툴바를 못 찾으면 서식 없이 넘어간다. 글은 이미 들어갔다.
         """
-        editor = page.frame(name="mainFrame") or page.main_frame
-        try:
-            selected = editor.evaluate(_SELECT_PREVIOUS_PARAGRAPH_JS)
-        except PlaywrightError:
-            selected = False
-        if not selected:
+        editor = self._select_previous_line(page)
+        if not editor:
             return
-        page.wait_for_timeout(200)
 
         if self._click_optional(frame, FONT_SIZE_BUTTON_SELECTORS):
             page.wait_for_timeout(300)
@@ -445,7 +470,38 @@ class NaverBlogPublisher:
         if not self._click_optional(frame, BOLD_BUTTON_SELECTORS):
             page.keyboard.press("Control+B")
         page.wait_for_timeout(200)
+        self._return_below(page, editor)
 
+    def _gray_previous_line(self, page: Page, frame: FrameLocator) -> None:
+        """방금 넣은 안내 줄을 회색 글씨로 바꾼다. 못 바꾸면 기본색으로 둔다."""
+        editor = self._select_previous_line(page)
+        if not editor:
+            return
+        if self._click_optional(frame, FONT_COLOR_BUTTON_SELECTORS):
+            page.wait_for_timeout(300)
+            if not self._click_optional(frame, GRAY_COLOR_SELECTORS):
+                print("  [!] 회색 글씨색을 찾지 못해 기본색으로 둡니다.")
+                page.keyboard.press("Escape")
+        else:
+            print("  [!] 글씨색 버튼을 찾지 못해 기본색으로 둡니다.")
+        page.wait_for_timeout(200)
+        self._return_below(page, editor)
+
+    @staticmethod
+    def _select_previous_line(page: Page):
+        """커서 바로 위 문단을 선택하고 에디터 프레임을 돌려준다. 못 하면 None."""
+        editor = page.frame(name="mainFrame") or page.main_frame
+        try:
+            selected = editor.evaluate(_SELECT_PREVIOUS_PARAGRAPH_JS)
+        except PlaywrightError:
+            selected = False
+        if not selected:
+            return None
+        page.wait_for_timeout(200)
+        return editor
+
+    @staticmethod
+    def _return_below(page: Page, editor) -> None:
         try:
             editor.evaluate(_RETURN_TO_NEXT_PARAGRAPH_JS)
         except PlaywrightError:
@@ -515,7 +571,38 @@ class NaverBlogPublisher:
             print(f"  [!] 상품 카드 삽입 실패, 텍스트 링크로 넣습니다: {exc}")
             return False
         finally:
-            self._close_shopping_connect(page, frame)
+            self._close_popup(page, frame, SHOPPING_CONNECT_POPUP)
+
+    def _insert_link_card(self, page: Page, frame: FrameLocator, url: str) -> bool:
+        """툴바의 '링크' 로 링크 카드를 넣는다. 못 넣으면 False."""
+        if not url:
+            return False
+        if not self._click_optional(frame, LINK_BUTTON_SELECTORS):
+            print("  [!] 링크 버튼을 찾지 못해 텍스트 링크로 넣습니다.")
+            return False
+
+        try:
+            frame.locator(LINK_POPUP).first.wait_for(state="visible", timeout=10_000)
+            before = frame.locator(LINK_COMPONENT).count()
+            frame.locator(f"{LINK_INPUT} >> visible=true").first.click(timeout=8000)
+            page.keyboard.press("Control+A")
+            self._paste_text(page, url)
+            if not self._click_optional(frame, [LINK_SEARCH_BUTTON]):
+                page.keyboard.press("Enter")
+            page.wait_for_timeout(3000)
+            frame.locator(f"{SHOPPING_CONNECT_CONFIRM_BUTTON} >> visible=true").first.click(timeout=8000)
+            page.wait_for_timeout(2500)
+            if frame.locator(LINK_COMPONENT).count() <= before:
+                print("  [!] 링크 카드가 들어가지 않아 텍스트 링크로 넣습니다.")
+                self._snap("link_card_missing")
+                return False
+            print(f"  링크 카드 삽입: {url}")
+            return True
+        except (PlaywrightTimeout, PlaywrightError) as exc:
+            print(f"  [!] 링크 카드 삽입 실패, 텍스트 링크로 넣습니다: {exc}")
+            return False
+        finally:
+            self._close_popup(page, frame, LINK_POPUP)
 
     def _search_products(self, page: Page, frame: FrameLocator, term: str) -> None:
         search = frame.locator(f"{SHOPPING_CONNECT_SEARCH_INPUT} >> visible=true").first
@@ -541,10 +628,10 @@ class NaverBlogPublisher:
         print(f"  상품 카드 삽입: {query}")
         return True
 
-    def _close_shopping_connect(self, page: Page, frame: FrameLocator) -> None:
+    def _close_popup(self, page: Page, frame: FrameLocator, popup_selector: str) -> None:
         """팝업이 남아 있으면 닫는다. 열린 채로 두면 다음 입력이 전부 엉킨다."""
         try:
-            popup = frame.locator(SHOPPING_CONNECT_POPUP).first
+            popup = frame.locator(popup_selector).first
             if not popup.is_visible(timeout=1500):
                 return
         except (PlaywrightTimeout, PlaywrightError):

@@ -63,12 +63,12 @@ def load_run(run_dir: Path) -> tuple[str, list[str], list[PostBlock]]:
 def _parse_naver_txt(text: str) -> list[PostBlock]:
     """예전 결과물처럼 upload.json 이 없을 때 naver.txt 를 읽는다."""
     ops: list[PostBlock] = []
-    for chunk in re.split(r"\n(?=\[(?:text|image|quote|divider|product)\])", text.strip()):
+    for chunk in re.split(r"\n(?=\[(?:text|image|quote|divider|product|link|notice)\])", text.strip()):
         match = re.match(r"\[(\w+)\]\s?(.*)", chunk, re.S)
         if not match:
             continue
         kind, value = match.group(1), match.group(2).strip()
-        if kind == "product":
+        if kind in ("product", "link"):
             # 첫 줄이 검색어이고 나머지가 상품을 못 찾았을 때 쓸 텍스트다.
             query, _, fallback = value.partition("\n")
             ops.append(PostBlock(kind=kind, value=fallback.strip(), query=query.strip()))
