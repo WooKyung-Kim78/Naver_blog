@@ -207,6 +207,7 @@ class ImageAsset:
     slot: str = ""
     prompt: str = ""
     owner: str = ""  # 묶어 쓸 때 어느 상품 이미지인지. "0", "1"...
+    gallery_index: int = -1  # 썸네일 갤러리 순서. 0 이 대표 이미지다
 
     @property
     def priority(self) -> int:

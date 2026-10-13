@@ -27,13 +27,14 @@ from pathlib import Path
 from typing import Callable
 
 import config
-from ai import analyst, critic, focus as focus_mod, humanizer, reviser, roundup as roundup_mod, seo as seo_mod, writer
+from ai import analyst, critic, focus as focus_mod, humanizer, image_screen, reviser, roundup as roundup_mod, seo as seo_mod, writer
 from ai.client import MyGenAssistClient
 from core.models import (
     KIND_CALLOUT,
     KIND_CTA,
     KIND_IMAGE,
     KIND_LINK,
+    SLOT_HERO,
     SLOT_INFOGRAPHIC,
     Article,
     Draft,
@@ -414,10 +415,12 @@ class Pipeline:
         집중 포인트를 고를 때 AI 에게 상세 이미지를 보여줘야 해서 집필보다 먼저 돈다.
         """
         candidates = [
-            ImageAsset(source="thumbnail", url=u, owner=owner) for u in product.thumbnail_urls[:6]
+            ImageAsset(source="thumbnail", url=u, owner=owner, gallery_index=i)
+            for i, u in enumerate(product.thumbnail_urls[:6])
         ]
+        detail_urls = [u for u in product.detail_image_urls if not image_screen.looks_like_policy(u)]
         candidates += [
-            ImageAsset(source="detail", url=u, owner=owner) for u in product.detail_image_urls[:12]
+            ImageAsset(source="detail", url=u, owner=owner) for u in detail_urls[:12]
         ]
         if not candidates:
             return []
@@ -428,12 +431,30 @@ class Pipeline:
         referer = product.resolved_url or product.page_url or product.url
         dest = run_dir / "images" / ("product" + (f"_{owner}" if owner else ""))
         available = self._processor.prepare(candidates, dest, referer=referer)
+        available = self._screen_details(available)
 
         by_source: dict[str, int] = {}
         for asset in available:
             by_source[asset.source] = by_source.get(asset.source, 0) + 1
         self.report(f"  사용 가능 {len(available)}개 (중복 제거 후) {by_source}")
         return available
+
+    def _screen_details(self, available: list[ImageAsset]) -> list[ImageAsset]:
+        """배송·교환·반품 안내 이미지를 빼고 제품 설명 이미지 위주로 남긴다."""
+        if not any(a.source == "detail" for a in available):
+            return available
+        if not image_screen.can_see(self.client):
+            self.report("  현재 AI 엔드포인트는 이미지를 볼 수 없어 배송·반품 이미지 검사를 건너뜁니다.")
+            return available
+
+        self.report("  상세 이미지 중 배송·교환·반품 안내를 AI 로 걸러내는 중")
+        try:
+            screened, counts = image_screen.screen(self.client, available)
+        except Exception as exc:  # noqa: BLE001 - 검사 실패로 원고를 잃을 수는 없다
+            self.report(f"  이미지 검사 실패({exc}). 걸러내지 않고 진행합니다.")
+            return available
+        self.report(f"  분류 결과 {counts}")
+        return screened
 
     def _pick_focus(
         self, product: Product, brief: ProductBrief, available: list[ImageAsset]
@@ -759,7 +780,19 @@ class Pipeline:
                     return max(candidates, key=lambda a: a.score)
             return None
 
-        shared = [s for s in slots if not s.startswith(("item", "cta")) and s != SLOT_INFOGRAPHIC]
+        # 글의 첫 이미지는 대표 상품의 썸네일이어야 하므로 상품별 슬롯보다 먼저 고른다.
+        if SLOT_HERO in slots:
+            lead_pool = [a for a in available if a.owner == "0"]
+            hero = planner.assign([SLOT_HERO], lead_pool, brief, stock_query=_stock_query(brief, seo))
+            for asset in hero.values():
+                if asset.phash is not None:
+                    used.add(asset.phash)
+            placed.update(hero)
+
+        shared = [
+            s for s in slots
+            if not s.startswith(("item", "cta")) and s not in (SLOT_INFOGRAPHIC, SLOT_HERO)
+        ]
         owned = [s for s in slots if s.startswith(("item", "cta"))]
 
         for slot in owned:

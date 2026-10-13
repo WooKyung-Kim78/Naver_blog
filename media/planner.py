@@ -92,6 +92,12 @@ class ImagePlanner:
                 if a.source == source and a.path and (a.phash is None or a.phash not in used)
             ]
             if candidates:
+                if slot == SLOT_HERO and source == "thumbnail":
+                    # 글의 첫 이미지는 상품 대표 썸네일이어야 한다. 점수보다 갤러리 순서가 먼저다.
+                    return min(
+                        candidates,
+                        key=lambda a: (a.gallery_index < 0, a.gallery_index, -a.score),
+                    )
                 return max(candidates, key=lambda a: a.score)
         return None
 
