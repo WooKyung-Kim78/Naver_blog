@@ -106,9 +106,22 @@ CLOSE_POPUP_SELECTORS = [
     ".se-help-panel-close-button",
 ]
 
+#: 발행 창. 클래스 뒤의 해시는 수시로 바뀌므로 접두사·aria·testid 로 찾는다 (2026-10 확인).
+PUBLISH_BUTTON_SELECTORS = ["button[class*='publish_btn__']", "button:text-is('발행')"]
+FINAL_PUBLISH_SELECTORS = ["button[data-testid='seOnePublishBtn']", "button[class*='confirm_btn__']"]
+CATEGORY_BUTTON = "button[aria-label='카테고리 목록 버튼']"
+CATEGORY_OPTION = "[class*='option_list_layer'] label"
+SUBJECT_BUTTON = "a[aria-label='주제 목록 버튼']"
+SUBJECT_OK_BUTTON = "[class*='layer_content_set_theme'] button[class*='ok_btn__']"
+TAG_INPUT = "#tag-input"
+
 
 class NaverBlogError(RuntimeError):
     pass
+
+
+def _same_label(text: str, wanted: str) -> bool:
+    return re.sub(r"\s+", "", text or "") == re.sub(r"\s+", "", wanted)
 
 
 @dataclass
@@ -127,6 +140,7 @@ class NaverBlogPublisher:
         self._browser = None
         self._context = None
         self.page: Page | None = None
+        self.post_url = ""
         # 로그인에 성공했을 때만 세션을 저장한다. 실패한 쿠키를 덮어쓰면
         # 다음에도 '로그인한 것처럼' 에디터로 넘어가게 된다.
         self._logged_in = False
@@ -651,20 +665,18 @@ class NaverBlogPublisher:
         return "임시저장 완료. 네이버 블로그 글쓰기 화면에서 내용을 확인한 뒤 직접 발행하세요."
 
     def _publish_now(self, page: Page, frame: FrameLocator, tags: list[str]) -> str:
-        self._click_first(
-            frame,
-            ["button:has-text('발행')", ".publish_btn__m9KHH", "[data-testid='publishButton']"],
-            "발행 버튼",
-        )
+        self._click_first(frame, PUBLISH_BUTTON_SELECTORS, "발행 버튼")
         page.wait_for_timeout(2500)
 
+        # 다른 카테고리·주제로 공개 발행되면 되돌리기 번거로우니 못 고르면 멈춘다.
         if self.cfg.category:
             self._select_category(page, frame, self.cfg.category)
+        if self.cfg.subject:
+            self._select_subject(page, frame, self.cfg.subject)
 
         if tags:
             try:
-                tag_input = frame.locator("#tag-input, input.tag_input__rvUB5").first
-                tag_input.click(timeout=8000)
+                frame.locator(TAG_INPUT).first.click(timeout=8000)
                 for tag in tags:
                     self._paste_text(page, tag)
                     page.keyboard.press("Enter")
@@ -674,28 +686,83 @@ class NaverBlogPublisher:
 
         self._snap("publish_dialog")
 
-        self._click_first(
-            frame,
-            [
-                ".confirm_btn__WEaBq",
-                "button.confirm_btn__WEaBq",
-                ".layer_btn_area button:has-text('발행')",
-                "button:has-text('발행')",
-            ],
-            "최종 발행 버튼",
-        )
-        page.wait_for_timeout(7000)
+        self._click_first(frame, FINAL_PUBLISH_SELECTORS, "최종 발행 버튼")
+        self.post_url = self._wait_post_url(page)
         self._snap("published")
-        return f"발행 완료: https://blog.naver.com/{self.cfg.blog_id}"
+        if not self.post_url:
+            if self._publish_layer_open(frame):
+                raise NaverBlogError(
+                    "최종 발행 버튼을 눌렀지만 발행 창이 그대로 남아 있습니다. 글은 발행되지 않았습니다.\n"
+                    "  브라우저 창의 안내 메시지를 확인하세요."
+                )
+            return f"발행 완료: https://blog.naver.com/{self.cfg.blog_id} (글 주소는 읽지 못했습니다)"
+        return f"발행 완료: {self.post_url}"
+
+    def _publish_layer_open(self, frame: FrameLocator) -> bool:
+        try:
+            return frame.locator(FINAL_PUBLISH_SELECTORS[0]).first.is_visible(timeout=1500)
+        except (PlaywrightTimeout, PlaywrightError):
+            return False
+
+    def _wait_post_url(self, page: Page, timeout_s: float = 30) -> str:
+        """발행 뒤 이동한 글 주소를 https://blog.naver.com/아이디/글번호 형태로 돌려준다."""
+        blog_id = re.escape(self.cfg.blog_id)
+        pattern = re.compile(rf"blog\.naver\.com/(?:{blog_id}/(\d+)|.*[?&]logNo=(\d+))")
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            # 글쓰기는 #mainFrame 안이라 주소가 위 창이 아니라 프레임에서 바뀔 수 있다.
+            urls = [page.url] + [f.url for f in page.frames]
+            for url in urls:
+                match = pattern.search(url or "")
+                if match:
+                    return f"https://blog.naver.com/{self.cfg.blog_id}/{match.group(1) or match.group(2)}"
+            page.wait_for_timeout(500)
+        print("  [!] 발행한 글 주소를 화면에서 찾지 못했습니다.")
+        return ""
 
     def _select_category(self, page: Page, frame: FrameLocator, category: str) -> None:
+        button = frame.locator(CATEGORY_BUTTON).first
         try:
-            frame.locator(".selectbox_button__jb1Dt, button.selectbox_button__jb1Dt").first.click(timeout=8000)
+            if _same_label(button.inner_text(timeout=8000), category):
+                return
+            button.click(timeout=8000)
             page.wait_for_timeout(1000)
-            frame.locator(f"label:has-text('{category}'), span:has-text('{category}')").first.click(timeout=8000)
+            frame.locator(CATEGORY_OPTION).filter(
+                has_text=re.compile(rf"^\s*{re.escape(category)}\s*$")
+            ).first.click(timeout=8000)
             page.wait_for_timeout(800)
+            chosen = button.inner_text(timeout=3000)
         except (PlaywrightTimeout, PlaywrightError) as exc:
-            print(f"  [!] 카테고리 '{category}' 선택 실패, 기본 카테고리로 발행합니다: {exc}")
+            self._snap("fail_category")
+            raise NaverBlogError(f"카테고리 '{category}' 를 고르지 못해 발행을 멈췄습니다: {exc}") from exc
+        if not _same_label(chosen, category):
+            self._snap("fail_category")
+            raise NaverBlogError(
+                f"카테고리 '{category}' 를 고르지 못해 발행을 멈췄습니다. 지금 선택: {chosen.strip()}\n"
+                "  NAVER_CATEGORY 를 블로그 카테고리 이름과 똑같이 맞추세요."
+            )
+
+    def _select_subject(self, page: Page, frame: FrameLocator, subject: str) -> None:
+        link = frame.locator(SUBJECT_BUTTON).first
+        try:
+            if _same_label(link.inner_text(timeout=8000).rstrip(" >"), subject):
+                return
+            link.click(timeout=8000)
+            page.wait_for_timeout(1000)
+            frame.locator(f"label[for^='{subject}_']").first.click(timeout=8000)
+            page.wait_for_timeout(500)
+            frame.locator(SUBJECT_OK_BUTTON).first.click(timeout=8000)
+            page.wait_for_timeout(800)
+            chosen = link.inner_text(timeout=3000)
+        except (PlaywrightTimeout, PlaywrightError) as exc:
+            self._snap("fail_subject")
+            raise NaverBlogError(f"주제 '{subject}' 를 고르지 못해 발행을 멈췄습니다: {exc}") from exc
+        if subject not in chosen:
+            self._snap("fail_subject")
+            raise NaverBlogError(
+                f"주제 '{subject}' 를 고르지 못해 발행을 멈췄습니다. 지금 선택: {chosen.strip()}\n"
+                "  NAVER_SUBJECT 를 발행 창의 주제 이름과 똑같이 맞추세요."
+            )
 
     # ------------------------------------------------------------------ 유틸
 

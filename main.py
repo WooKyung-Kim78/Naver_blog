@@ -9,12 +9,16 @@
     python main.py upload --tistory-only        티스토리에만 다시 올리기
     python main.py tistory-login                티스토리(카카오) 로그인을 한 번 저장
     python main.py upload --md 제안.md          수정 제안 마크다운으로 article 을 다시 쓴 뒤 올리기
+    python main.py post --each --url A --url B  상품마다 한 글씩 순서대로 올리기
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import sys
+import time
+import unicodedata
 import webbrowser
 from pathlib import Path
 
@@ -32,6 +36,9 @@ from publish.tistory import TistoryError
 
 console = Console()
 
+#: 집중 포인트를 이 시간 안에 고르지 않으면 1안으로 진행한다(초).
+FOCUS_TIMEOUT = 5
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="네이버 상품 리뷰 블로그 생성기")
@@ -42,7 +49,11 @@ def main() -> int:
     post = sub.add_parser("post", help="상품 URL 로 리뷰 생성")
     post.add_argument(
         "--url", action="append", required=True, dest="urls",
-        help="본문에 넣을 구매 링크. 여러 번 주면 묶어 한 글로 쓴다 (최대 4개)",
+        help="본문에 넣을 구매 링크. 여러 번 주면 묶어 한 글로 쓴다 (최대 4개). --each 와 같이 주면 한 글씩 쓴다",
+    )
+    post.add_argument(
+        "--each", action="store_true",
+        help="여러 --url 을 묶지 않고 상품마다 한 글씩 순서대로 만들어 올린다",
     )
     post.add_argument(
         "--page-url", action="append", default=[], dest="page_urls",
@@ -202,15 +213,19 @@ def cmd_post(args) -> int:
         choose=(lambda options: FocusChoice(point=options[0])) if args.auto_focus else _choose_focus,
         handoff=_handoff,
         handoff_on_block=args.browser,
+        ask_page_url=_ask_page_url,
     )
 
     urls = args.urls
+    if args.each and len(urls) > 1:
+        return _post_each(pipeline, args)
     if len(urls) > MAX_PRODUCTS:
         console.print(f"[red]한 글에 묶을 상품은 {MAX_PRODUCTS}개까지입니다.[/red] 지금은 {len(urls)}개입니다.")
+        console.print("  한 글씩 따로 올리려면 --each 를 붙이세요.")
         return 1
 
     if len(urls) == 1:
-        page_url = _match_page_url(urls[0], args.page_urls) or _ask_page_url(urls[0])
+        page_url = _match_page_url(urls[0], args.page_urls)
         result = pipeline.run(
             urls[0], page_url=page_url, manual_desc=args.desc, collect_images=not args.no_images
         )
@@ -219,14 +234,49 @@ def cmd_post(args) -> int:
             console.print("[yellow]여러 상품을 묶을 때는 --desc 를 쓰지 않습니다. 상품마다 페이지를 읽습니다.[/yellow]")
         items = []
         for i, buy in enumerate(urls, 1):
-            page = ""
-            if len(args.page_urls) == len(urls):
-                page = args.page_urls[i - 1]
-            else:
-                page = _ask_page_url(buy, index=i, total=len(urls))
+            page = args.page_urls[i - 1] if len(args.page_urls) == len(urls) else ""
             items.append((buy, page, ""))
         result = pipeline.run_roundup(items, collect_images=not args.no_images)
 
+    return _finish_post(result, args)
+
+
+def _post_each(pipeline: Pipeline, args) -> int:
+    """여러 상품을 한 글씩 순서대로 만들고 올린다. 하나가 실패해도 다음 상품은 계속한다."""
+    urls = args.urls
+    if args.desc:
+        console.print("[yellow]--each 에서는 --desc 를 쓰지 않습니다. 상품마다 페이지를 읽습니다.[/yellow]")
+    if args.md_path:
+        console.print("[yellow]--each 에서는 --md 를 쓰지 않습니다. 같은 제안이 모든 글에 적용되기 때문입니다.[/yellow]")
+        args.md_path = ""
+    pages = args.page_urls if len(args.page_urls) == len(urls) else [""] * len(urls)
+
+    done: list[tuple[int, str, str]] = []
+    failed: list[tuple[int, str, str]] = []
+    for i, (buy, page) in enumerate(zip(urls, pages), 1):
+        console.print()
+        console.rule(f"[bold]{i}/{len(urls)}[/bold]  {buy}")
+        try:
+            result = pipeline.run(buy, page_url=page, manual_desc="", collect_images=not args.no_images)
+            _finish_post(result, args)
+            done.append((i, buy, result.draft.article.title))
+        except (ProductUnavailable, NaverBlogError, TistoryError, AIError, RuntimeError) as exc:
+            console.print(Panel(explain(exc), title=f"{i}번 상품 실패, 다음 상품으로 넘어갑니다",
+                                title_align="left", border_style="red"))
+            failed.append((i, buy, explain(exc).splitlines()[0]))
+
+    summary = Table("#", "구매 링크", "결과", title="순차 포스팅 결과", title_justify="left")
+    for i, buy, title in done:
+        summary.add_row(str(i), buy, f"[green]완료[/green] {title}")
+    for i, buy, reason in failed:
+        summary.add_row(str(i), buy, f"[red]실패[/red] {reason}")
+    console.print()
+    console.print(summary)
+    return 1 if failed else 0
+
+
+def _finish_post(result: PipelineResult, args) -> int:
+    """생성 결과를 보여 주고, --dry-run 이 아니면 네이버·티스토리에 올린다."""
     _show_report(result)
     console.print(f"\n결과 저장 위치: [white]{result.run_dir}[/white]")
     console.print("  article.html  미리보기 / suggestions.md  수정 제안 / naver.txt  업로드될 내용")
@@ -249,6 +299,7 @@ def cmd_post(args) -> int:
         run_dir=result.run_dir,
         debug=args.debug,
         md_path=args.md_path,
+        review=args.review,
         tistory_only=args.tistory_only,
         no_tistory=args.no_tistory,
     )
@@ -266,13 +317,17 @@ def cmd_upload(args) -> int:
     console.print(f"  블록: {len(payload)}개")
     return _upload(
         title, tags, payload, run_dir=run_dir, debug=args.debug, md_path=args.md_path,
-        tistory_only=args.tistory_only, no_tistory=args.no_tistory,
+        review=args.review, tistory_only=args.tistory_only, no_tistory=args.no_tistory,
     )
 
 
 def _add_destination_flags(parser) -> None:
     parser.add_argument("--tistory-only", action="store_true", help="네이버는 건너뛰고 티스토리에만 올린다")
     parser.add_argument("--no-tistory", action="store_true", help="티스토리에는 올리지 않는다")
+    parser.add_argument(
+        "--review", action="store_true",
+        help="업로드 전에 HTML 을 보여 주고 수정 제안을 받는다 (.env 의 REVIEW_BEFORE_UPLOAD=true 와 같다)",
+    )
 
 
 def cmd_tistory_login() -> int:
@@ -296,14 +351,16 @@ def _upload(
     run_dir,
     debug: bool,
     md_path: str = "",
+    review: bool = False,
     tistory_only: bool = False,
     no_tistory: bool = False,
 ) -> int:
-    reviewed = _review_before_upload(run_dir, title, tags, payload, md_path=md_path)
-    if reviewed is None:
-        console.print(f"중단했습니다. 다시 올리려면: python main.py upload --from {run_dir}")
-        return 0
-    title, tags, payload = reviewed
+    if md_path or review or config.load_post_config().review_before_upload:
+        reviewed = _review_before_upload(run_dir, title, tags, payload, md_path=md_path)
+        if reviewed is None:
+            console.print(f"중단했습니다. 다시 올리려면: python main.py upload --from {run_dir}")
+            return 0
+        title, tags, payload = reviewed
 
     do_naver = not tistory_only
     tistory_cfg = config.load_tistory_config()
@@ -316,16 +373,17 @@ def _upload(
         console.print("[yellow]--tistory-only 와 --no-tistory 를 같이 쓸 수 없습니다.[/yellow]")
         return 1
 
-    if not _confirm_destinations(do_naver, do_tistory, tistory_cfg, run_dir):
-        return 0
-
     naver_message = ""
     if do_naver:
         naver_message = _publish_naver(title, tags, payload, run_dir=run_dir, debug=debug)
         console.print(f"\n[bold green]{naver_message}[/bold green]")
 
     if do_tistory:
-        naver_url = _ask_naver_url(run_dir, just_saved=do_naver)
+        saved = run_dir / "naver.url"
+        naver_url = saved.read_text(encoding="utf-8").strip() if saved.exists() else ""
+        if not naver_url:
+            # 발행 후 글 주소를 얻지 못했을 때만 묻는다.
+            naver_url = _ask_naver_url(run_dir)
         if not naver_url:
             console.print("\n[yellow]티스토리는 건너뛰었습니다.[/yellow]")
             console.print(f"  나중에 올리려면: python main.py upload --from {run_dir} --tistory-only")
@@ -346,28 +404,6 @@ def _upload(
     return 0
 
 
-def _confirm_destinations(do_naver: bool, do_tistory: bool, tistory_cfg, run_dir) -> bool:
-    lines = []
-    if do_naver:
-        naver_cfg = config.load_naver_config()
-        naver_cfg.validate()
-        mode = "임시저장" if naver_cfg.post_mode == "draft" else "즉시 발행"
-        lines.append(f"네이버 블로그  {mode}")
-    if do_tistory:
-        tistory_cfg.validate()
-        vis = "공개 발행" if tistory_cfg.wants_public() else "비공개 저장"
-        cat = tistory_cfg.category or "기본 카테고리"
-        lines.append(f"티스토리 {tistory_cfg.home} / {cat}  {vis}")
-        lines.append("티스토리에는 제목과 네이버 발행 글 링크, 태그만 올립니다.")
-        if not tistory_cfg.wants_public():
-            lines.append("비공개 글은 구글에 나오지 않습니다. 노출하려면 TISTORY_VISIBILITY=3 으로 바꾸세요.")
-    console.print()
-    if _ask("이 내용으로 올릴까요?\n  " + "\n  ".join(lines) + "\n(y/n)", ("y", "n")) != "y":
-        console.print(f"중단했습니다. 다시 올리려면: python main.py upload --from {run_dir}")
-        return False
-    return True
-
-
 def _publish_naver(title: str, tags: list[str], payload, *, run_dir, debug: bool) -> str:
     from publish.naver_blog import NaverBlogPublisher
 
@@ -378,30 +414,22 @@ def _publish_naver(title: str, tags: list[str], payload, *, run_dir, debug: bool
             console.print("[cyan]›[/cyan] 네이버 로그인 중")
             publisher.ensure_login()
             console.print("[cyan]›[/cyan] 로그인 확인됨. 에디터에 내용 입력 중")
-            return publisher.publish(title, payload, tags)
+            message = publisher.publish(title, payload, tags)
+            if publisher.post_url:
+                (run_dir / "naver.url").write_text(publisher.post_url + "\n", encoding="utf-8")
+            return message
     except NaverBlogError:
         console.print(f"\n[yellow]원고는 그대로 있습니다.[/yellow] 다시 올리려면:")
         console.print(f"  python main.py upload --from {run_dir}")
         raise
 
 
-def _ask_naver_url(run_dir, *, just_saved: bool) -> str:
-    """네이버에서 직접 발행한 글 주소를 받는다. n 을 넣으면 빈 문자열을 돌려준다."""
+def _ask_naver_url(run_dir) -> str:
+    """발행 주소를 자동으로 못 얻었을 때 네이버 글 주소를 받는다. n 을 넣으면 빈 문자열을 돌려준다."""
     saved_file = run_dir / "naver.url"
-    saved = saved_file.read_text(encoding="utf-8").strip() if saved_file.exists() else ""
     console.print()
-    if just_saved:
-        console.print(Panel(
-            "네이버 블로그에서 임시저장한 글을 [bold]직접 발행[/bold]하세요.\n"
-            "발행이 완료될 때까지 기다립니다. 발행한 뒤 그 글의 주소를 여기에 넣으세요.\n"
-            "예) https://blog.naver.com/아이디/223456789012\n\n"
-            "[white]n[/white]  티스토리 건너뛰기",
-            title="네이버 발행 대기", title_align="left", border_style="cyan",
-        ))
-    else:
-        console.print("티스토리에 넣을 네이버 발행 글 주소를 입력하세요. (n: 건너뛰기)")
-    if saved:
-        console.print(f"  엔터만 누르면 지난번 주소를 씁니다: {saved}")
+    console.print("티스토리에 넣을 네이버 발행 글 주소를 입력하세요. (n: 건너뛰기)")
+    console.print("[dim]예) https://blog.naver.com/아이디/223456789012[/dim]")
 
     while True:
         try:
@@ -410,8 +438,6 @@ def _ask_naver_url(run_dir, *, just_saved: bool) -> str:
             return ""
         if answer.lower() == "n":
             return ""
-        if not answer and saved:
-            return saved
         if _is_naver_post_url(answer):
             saved_file.write_text(answer + "\n", encoding="utf-8")
             return answer
@@ -544,35 +570,28 @@ def _match_page_url(buy_url: str, page_urls: list[str]) -> str:
     return ""
 
 
-def _ask_page_url(buy_url: str, *, index: int = 0, total: int = 0) -> str:
-    """내용을 긁어올 실제 상품 페이지를 물어본다.
-
-    브랜드 커넥트 제휴 링크는 중간 페이지를 거쳐서 상품 내용이 제대로 안 잡히는
-    경우가 있다. 판매 페이지 주소를 직접 받으면 그 문제가 사라진다.
-    """
-    title = "실제 상품 페이지"
-    if total:
-        title = f"실제 상품 페이지 ({index}/{total})"
+def _ask_page_url(buy_url: str) -> str:
+    """구매 링크로 수집이 막혔을 때만 실제 상품 페이지를 물어본다."""
     console.print()
     console.print(Panel(
         f"[dim]구매 링크[/dim]  {buy_url}\n"
-        "이 링크는 블로그 본문의 구매 링크로 그대로 들어갑니다. (제휴 추적 유지)\n\n"
+        "이 링크로는 상품 페이지를 읽지 못했습니다. 본문 구매 링크는 그대로 유지됩니다.\n\n"
         "내용과 이미지를 긁어올 [bold]실제 상품 판매 페이지[/bold] 주소를 알려주세요.\n"
         "[dim]예: https://brand.naver.com/finevu/products/13030260544[/dim]\n"
-        "[dim]모르면 그냥 엔터. 구매 링크를 따라가서 긁습니다.[/dim]",
-        title=title, title_align="left", border_style="cyan",
+        "[dim]모르면 그냥 엔터.[/dim]",
+        title="실제 상품 페이지", title_align="left", border_style="yellow",
     ))
 
     while True:
         try:
             answer = input("> ").strip()
         except EOFError:  # 파이프로 실행한 경우
-            return buy_url
+            return ""
         if not answer:
-            return buy_url
+            return ""
         if answer.startswith(("http://", "https://")):
             return answer
-        console.print("[yellow]http 로 시작하는 주소를 넣어주세요. 그냥 쓰려면 엔터.[/yellow]")
+        console.print("[yellow]http 로 시작하는 주소를 넣어주세요. 건너뛰려면 엔터.[/yellow]")
 
 
 def _handoff(url: str) -> bool:
@@ -625,11 +644,20 @@ def _choose_focus(options: list[FocusPoint]) -> FocusChoice:
                             title_align="left", border_style="white"))
 
     numbers = tuple(str(i) for i in range(1, len(options) + 1))
-    answer = _ask(
-        f"어느 점에 집중할까요? ({'/'.join(numbers)}"
-        " · r=다시 제안받기 · s=포인트 없이 진행)",
-        (*numbers, "r", "s"),
-    )
+    valid = (*numbers, "r", "s")
+    while True:
+        console.print(
+            f"어느 점에 집중할까요? ({'/'.join(numbers)} · r=다시 제안받기 · s=포인트 없이 진행)\n"
+            f"[dim]{FOCUS_TIMEOUT}초 안에 입력을 시작하지 않으면 1번으로 진행합니다.[/dim]"
+        )
+        typed = _timed_input(FOCUS_TIMEOUT)
+        if typed is None:
+            console.print("[cyan]입력이 없어 1번으로 진행합니다.[/cyan]")
+            return FocusChoice(point=options[0])
+        answer = typed.strip().lower()
+        if answer in valid:
+            break
+        console.print(f"[yellow]{' / '.join(valid)} 중에서 입력해주세요.[/yellow]")
 
     if answer == "s":
         return FocusChoice()
@@ -699,6 +727,80 @@ def _ask(prompt: str, valid: tuple[str, ...]) -> str:
         if answer in valid:
             return answer
         console.print(f"[yellow]{' / '.join(valid)} 중에서 입력해주세요.[/yellow]")
+
+
+def _timed_input(timeout: float) -> str | None:
+    """timeout 초 안에 입력을 시작하지 않으면 None. 치기 시작하면 엔터까지 기다린다."""
+    sys.stdout.write("> ")
+    sys.stdout.flush()
+    if not sys.stdin.isatty():
+        try:
+            return input()
+        except EOFError:
+            return None
+    if sys.platform == "win32":
+        return _timed_input_windows(timeout)
+    return _timed_input_posix(timeout)
+
+
+def _timed_input_windows(timeout: float) -> str | None:
+    import msvcrt
+
+    deadline = time.monotonic() + timeout
+    while not msvcrt.kbhit():
+        if time.monotonic() >= deadline:
+            print()
+            return None
+        time.sleep(0.05)
+
+    chars: list[str] = []
+    while True:
+        ch = msvcrt.getwch()
+        if ch in ("\r", "\n"):
+            print()
+            return "".join(chars)
+        if ch == "\x03":
+            raise KeyboardInterrupt
+        if ch in ("\x00", "\xe0"):  # 방향키 등 특수키는 두 글자로 온다
+            msvcrt.getwch()
+            continue
+        if ch == "\b":
+            if chars:
+                width = 2 if unicodedata.east_asian_width(chars.pop()) in "WF" else 1
+                sys.stdout.write("\b" * width + " " * width + "\b" * width)
+                sys.stdout.flush()
+            continue
+        chars.append(ch)
+        sys.stdout.write(ch)
+        sys.stdout.flush()
+
+
+def _timed_input_posix(timeout: float) -> str | None:
+    import select
+    import termios
+    import tty
+
+    fd = sys.stdin.fileno()
+    saved = termios.tcgetattr(fd)
+    try:
+        # 줄 단위 모드에서는 엔터 전까지 select 가 깨어나지 않아, 첫 글자만 글자 단위로 받는다.
+        tty.setcbreak(fd)
+        ready, _, _ = select.select([fd], [], [], timeout)
+        first = os.read(fd, 16).decode("utf-8", errors="ignore") if ready else None
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+    if first is None:
+        print()
+        return None
+    if first.endswith(("\r", "\n")):
+        print()
+        return first.strip()
+    sys.stdout.write(first)
+    sys.stdout.flush()
+    try:
+        return first + input()
+    except EOFError:
+        return first
 
 
 def explain(exc: Exception) -> str:

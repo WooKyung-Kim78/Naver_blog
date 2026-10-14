@@ -137,6 +137,7 @@ class NaverConfig:
     password: str
     blog_id: str
     category: str
+    subject: str
     post_mode: str
     headed: bool
 
@@ -194,6 +195,8 @@ class PostConfig:
     #: 쇼핑 커넥트 상품 카드의 creatorSpaceId. 크리에이터마다 고정이고 구매 링크에는
     #: 들어 있지 않아서 직접 받는다. 비워 두면 카드에서 그 항목만 빠진다.
     creator_space_id: str = ""
+    #: 켜면 업로드 전에 HTML 을 보여 주고 수정 제안을 기다린다.
+    review_before_upload: bool = False
 
 
 def _proxies() -> dict[str, str]:
@@ -267,8 +270,9 @@ def load_naver_config() -> NaverConfig:
         user_id=_get("NAVER_ID"),
         password=_get("NAVER_PW"),
         blog_id=_get("NAVER_BLOG_ID"),
-        category=_get("NAVER_CATEGORY"),
-        post_mode=_get("POST_MODE", "draft").lower(),
+        category=_get("NAVER_CATEGORY", "이슈상품"),
+        subject=_get("NAVER_SUBJECT", "상품리뷰"),
+        post_mode=_get("POST_MODE", "publish").lower(),
         headed=_get_bool("BROWSER_HEADED", True),
     )
 
@@ -290,7 +294,7 @@ def load_tistory_config() -> TistoryConfig:
         blog_name=_blog_name(_get("TISTORY_BLOG_NAME")),
         category=_get("TISTORY_CATEGORY"),
         visibility=_get("TISTORY_VISIBILITY"),
-        post_mode=_get("POST_MODE", "draft").lower(),
+        post_mode=_get("POST_MODE", "publish").lower(),
         headed=_get_bool("BROWSER_HEADED", True),
     )
 
@@ -303,4 +307,5 @@ def load_post_config() -> PostConfig:
         ),
         persona=_get("BLOG_PERSONA", "친근하고 솔직한 리뷰어 말투"),
         creator_space_id=_get("NAVER_CREATOR_SPACE_ID"),
+        review_before_upload=_get_bool("REVIEW_BEFORE_UPLOAD", False),
     )

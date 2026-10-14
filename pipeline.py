@@ -63,6 +63,8 @@ Chooser = Callable[[list[FocusPoint]], FocusChoice]
 #: 수집이 막혔을 때 브라우저 창을 띄우고 사용자가 직접 통과시키게 하는 콜백.
 #: 주소를 받아 안내를 띄우고, 사용자가 준비될 때까지 막아 둔 뒤 진행 여부를 돌려준다.
 Handoff = Callable[[str], bool]
+#: 구매 링크로 수집이 막혔을 때 실제 판매 페이지 주소를 묻는 콜백. 빈 값이면 건너뛴다.
+PageAsker = Callable[[str], str]
 
 #: 재제안을 무한정 돌면 토큰만 태운다. 이 횟수를 넘기면 포인트 없이 진행한다.
 MAX_FOCUS_ROUNDS = 4
@@ -99,6 +101,7 @@ class Pipeline:
         choose: Chooser | None = None,
         handoff: Handoff | None = None,
         handoff_on_block: bool = False,
+        ask_page_url: PageAsker | None = None,
     ):
         self.report = report or (lambda _: None)
         # 콜백이 없으면 첫 번째 안을 자동 선택한다 (비대화형 실행용).
@@ -109,6 +112,7 @@ class Pipeline:
         # 다시 긁어보고 포기한다. 상세 이미지가 한 장도 없을 때는 이 값과 무관하게
         # 창을 띄운다.
         self.handoff_on_block = handoff_on_block
+        self.ask_page_url = ask_page_url
         self.ai_cfg = config.load_ai_config()
         self.img_cfg = config.load_image_config()
         self.gen_cfg = config.load_imagegen_config()
@@ -329,6 +333,7 @@ class Pipeline:
         """
         urls = [page_url] + ([buy_url] if buy_url != page_url else [])
         problem = ""
+        asked = False
 
         # 브라우저로 넘길 수 있으면 오래 기다리지 않는다. 사용자가 앞에 앉아 있는데
         # 몇 분씩 재시도를 지켜보게 할 이유가 없다.
@@ -354,6 +359,21 @@ class Pipeline:
                 self.report(f"  [막힘] {problem}")
                 if index + 1 < len(urls):
                     self.report("  구매 링크로 다시 시도합니다.")
+
+            if self.ask_page_url and not asked:
+                asked = True
+                new_url = self.ask_page_url(buy_url)
+                if new_url and new_url not in urls:
+                    urls.insert(0, new_url)
+                    page_url = new_url
+                    self.report(f"상품 페이지 수집 중: {new_url}")
+                    product = product_scraper.fetch(
+                        new_url, verify_ssl=self.ai_cfg.verify_ssl, proxies=self.ai_cfg.proxies
+                    )
+                    problem = product_scraper.diagnose(product)
+                    if not problem:
+                        return product, new_url, False
+                    self.report(f"  [막힘] {problem}")
 
             # 주소를 다 시도해 보고도 막혔으면 창을 띄워 사용자에게 넘긴다.
             if self.handoff_on_block:
