@@ -4,13 +4,14 @@ FAQ 를 글로 늘어놓으면 눈에 들어오지 않아서, 그 자리를 이 
 네이버 스마트에디터는 HTML 을 받지 않으므로 '한눈에 보이는 것' 을 본문에 넣으려면
 결국 이미지여야 한다. 그래서 HTML 로 꾸미지 않고 Pillow 로 직접 그린다.
 
-레이아웃은 네 덩어리다. 제목 배너 / 핵심 특징 아이콘 타일 / 이런 분께 / 총평.
+레이아웃은 네 덩어리다. 제목 배너 / 핵심 특징 아이콘 타일 / 이런 분께 / 2컷 웹툰 총평.
 글은 줄 수를 정해 두고 넘치면 말줄임표로 자른다. 길어지면 한눈에 안 들어온다.
 """
 
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -35,6 +36,10 @@ WARN = "#92400e"
 WARN_BG = "#fffbeb"
 SUMMARY_BG = "#eff6ff"
 SUMMARY_INK = "#1e40af"
+BUBBLE_BLUE_BG = "#f0f9ff"
+BUBBLE_BLUE_LINE = "#bae6fd"
+BUBBLE_GREEN_BG = "#f0fdf4"
+BUBBLE_GREEN_LINE = "#bbf7d0"
 CARD_BG = "#ffffff"
 PAGE_BG = "#f8fafc"
 
@@ -67,7 +72,7 @@ RADIUS = 14
 MAX_FEATURES = 4
 MAX_AUDIENCE = 2
 #: 총평 글자 수 상한. 넘치면 마지막 문장 끝에서 자른다.
-MAX_VERDICT_CHARS = 1000
+MAX_VERDICT_CHARS = 400
 
 
 @dataclass
@@ -352,25 +357,94 @@ def _audience_block(good: list[str], bad: list[str], fonts: _Fonts, inner: int) 
     return _Block(height, paint)
 
 
+def _split_cuts(summary: list[str]) -> tuple[str, str]:
+    """총평 문단들을 2컷(1컷: 체감, 2컷: 결론)으로 간결하게 나눈다. 각 컷당 최대 2문장으로 축약."""
+    if not summary:
+        return "", ""
+
+    if len(summary) >= 2:
+        s1 = [s.strip() for s in re.split(r"(?<=[.?!])\s+", summary[0].strip()) if s.strip()]
+        s2 = [s.strip() for s in re.split(r"(?<=[.?!])\s+", summary[1].strip()) if s.strip()]
+        cut1 = " ".join(s1[:2]) if s1 else summary[0].strip()
+        cut2 = " ".join(s2[:2]) if s2 else summary[1].strip()
+        return cut1, cut2
+
+    text = summary[0].strip()
+    sentences = [s.strip() for s in re.split(r"(?<=[.?!])\s+", text) if s.strip()]
+    if len(sentences) >= 2:
+        mid = math.ceil(len(sentences) / 2)
+        cut1 = " ".join(sentences[:min(mid, 2)])
+        cut2 = " ".join(sentences[mid:mid + 2])
+        return cut1, cut2
+
+    return text, "직접 써보고 용도와 취향에 맞게 현명한 선택을 해보세요!"
+
+
 def _summary_block(summary: list[str], fonts: _Fonts, inner: int) -> _Block:
-    """총평. 번호 없이 문단 그대로 넣는다."""
-    side = 26
-    wrapped = [_wrap(paragraph, fonts.verdict, inner - side * 2) for paragraph in summary]
-    head_h = 22 + _line_height(fonts.section) + 12
-    para_gap = 10
-    body_h = sum(len(lines) * _line_height(fonts.verdict) for lines in wrapped) + para_gap * (len(wrapped) - 1)
-    height = head_h + body_h + 22
+    """총평을 웹툰 형식(체감/결론)으로 그린다."""
+    cut1_text, cut2_text = _split_cuts(summary)
+    gutter = 14
+    bubble_x = PAD + 136
+    bubble_w = inner - 136 - 18
+    text_w = bubble_w - 32
+
+    lines1 = _wrap(cut1_text, fonts.verdict, text_w, max_lines=4)
+    lines2 = _wrap(cut2_text, fonts.verdict, text_w, max_lines=4)
+
+    line_h = _line_height(fonts.verdict)
+    head_bar_h = 38
+
+    bubble_h1 = 28 + len(lines1) * line_h
+    panel_h1 = max(head_bar_h + 104, head_bar_h + bubble_h1 + 16)
+
+    bubble_h2 = 28 + len(lines2) * line_h
+    panel_h2 = max(head_bar_h + 104, head_bar_h + bubble_h2 + 16)
+
+    sec_head_h = _section_head_height(fonts)
+    height = sec_head_h + panel_h1 + gutter + panel_h2
 
     def paint(draw: ImageDraw.ImageDraw, top: int) -> None:
-        _round(draw, PAD, top, inner, height, SUMMARY_BG)
-        _pin(draw, PAD + side, top + 24, SUMMARY_INK)
-        _text(draw, PAD + side + 24, top + 22, "총평", fonts.section, SUMMARY_INK)
-        y = top + head_h
-        for lines in wrapped:
-            for line in lines:
-                _text(draw, PAD + side, y, line, fonts.verdict, INK)
-                y += _line_height(fonts.verdict)
-            y += para_gap
+        _section_head(draw, PAD, top, "총평", fonts, INK, ACCENT)
+
+        # 1컷 (실사용 체감)
+        p1_top = top + sec_head_h
+        _round(draw, PAD, p1_top, inner, panel_h1, CARD_BG, outline=LINE, width=1.5)
+
+        _circle(draw, PAD + 24, p1_top + 21, 3.5, "#0284c7")
+        _text(draw, PAD + 34, p1_top + 12, "직접 써본 솔직 체감", fonts.item, INK)
+
+        char1_cy = p1_top + head_bar_h + 34
+        _draw_cut1_character(draw, PAD + 66, char1_cy)
+        _round(draw, PAD + 44, char1_cy + 36, 44, 20, "#f1f5f9", radius=10)
+        _text(draw, PAD + 51, char1_cy + 39, "체감 중", fonts.pill, MUTED)
+
+        b1_y = p1_top + head_bar_h + 4
+        tail1_y = max(b1_y + 14, min(int(char1_cy + 6), b1_y + bubble_h1 - 14))
+        _speech_bubble(draw, bubble_x, b1_y, bubble_w, bubble_h1, tail1_y, BUBBLE_BLUE_BG, BUBBLE_BLUE_LINE)
+        ty = b1_y + 14
+        for line in lines1:
+            _text(draw, bubble_x + 16, ty, line, fonts.verdict, INK)
+            ty += line_h
+
+        # 2컷 (최종 결론)
+        p2_top = p1_top + panel_h1 + gutter
+        _round(draw, PAD, p2_top, inner, panel_h2, CARD_BG, outline=LINE, width=1.5)
+
+        _circle(draw, PAD + 24, p2_top + 21, 3.5, ACCENT)
+        _text(draw, PAD + 34, p2_top + 12, "최종 결론 & 한줄 요약", fonts.item, INK)
+
+        char2_cy = p2_top + head_bar_h + 34
+        _draw_cut2_character(draw, PAD + 66, char2_cy)
+        _round(draw, PAD + 44, char2_cy + 36, 44, 20, "#dcfce7", radius=10)
+        _text(draw, PAD + 51, char2_cy + 39, "대만족!", fonts.pill, GOOD)
+
+        b2_y = p2_top + head_bar_h + 4
+        tail2_y = max(b2_y + 14, min(int(char2_cy + 6), b2_y + bubble_h2 - 14))
+        _speech_bubble(draw, bubble_x, b2_y, bubble_w, bubble_h2, tail2_y, BUBBLE_GREEN_BG, BUBBLE_GREEN_LINE)
+        ty = b2_y + 14
+        for line in lines2:
+            _text(draw, bubble_x + 16, ty, line, fonts.verdict, INK)
+            ty += line_h
 
     return _Block(height, paint)
 
@@ -398,14 +472,164 @@ def _round(
     *,
     radius: int = RADIUS,
     outline: str | None = None,
+    width: float = 1.0,
 ) -> None:
     draw.rounded_rectangle(
         [x * SCALE, y * SCALE, (x + w) * SCALE - 1, (y + h) * SCALE - 1],
         radius=radius * SCALE,
         fill=color,
         outline=outline,
-        width=SCALE if outline else 0,
+        width=round(width * SCALE) if outline else 0,
     )
+
+
+def _speech_bubble(
+    draw: ImageDraw.ImageDraw,
+    x: int,
+    y: int,
+    w: int,
+    h: int,
+    tail_target_y: int,
+    bg_color: str,
+    outline_color: str,
+) -> None:
+    """말풍선 본체와 캐릭터를 향하는 꼬리를 그린다."""
+    _round(draw, x, y, w, h, bg_color, radius=14, outline=outline_color, width=1.5)
+    tail_top = tail_target_y - 6
+    tail_tip = tail_target_y
+    tail_bot = tail_target_y + 6
+    _poly(draw, [(x + 2, tail_top), (x - 14, tail_tip), (x + 2, tail_bot)], bg_color)
+    draw.line(
+        [(x * SCALE, tail_top * SCALE), ((x - 14) * SCALE, tail_tip * SCALE)],
+        fill=outline_color,
+        width=round(1.5 * SCALE),
+    )
+    draw.line(
+        [((x - 14) * SCALE, tail_tip * SCALE), (x * SCALE, tail_bot * SCALE)],
+        fill=outline_color,
+        width=round(1.5 * SCALE),
+    )
+
+
+def _draw_cut1_character(draw: ImageDraw.ImageDraw, cx: float, cy: float) -> None:
+    """1컷: 호기심/체감 표정 캐릭터 (체크 느낌표, 턱에 괸 손)."""
+    _circle(draw, cx, cy - 6, 26, "#2d3748")
+    _circle(draw, cx - 16, cy, 13, "#2d3748")
+    _circle(draw, cx + 16, cy, 13, "#2d3748")
+    _round(draw, int(cx - 22), int(cy + 22), 44, 28, "#0284c7", radius=10)
+    _poly(draw, [(cx - 6, cy + 22), (cx, cy + 28), (cx + 6, cy + 22)], "#ffffff")
+    _circle(draw, cx - 20, cy + 2, 5.5, "#ffedd5")
+    _circle(draw, cx + 20, cy + 2, 5.5, "#ffedd5")
+    _circle(draw, cx, cy + 2, 20, "#ffedd5")
+    _circle(draw, cx - 9, cy - 13, 14, "#2d3748")
+    _circle(draw, cx + 9, cy - 13, 14, "#2d3748")
+    _circle(draw, cx, cy - 15, 15, "#2d3748")
+    _circle(draw, cx - 8, cy + 1, 4.2, "#1f2937")
+    _circle(draw, cx - 9.5, cy - 0.5, 1.6, "#ffffff")
+    _circle(draw, cx - 7, cy + 2.5, 0.9, "#ffffff")
+    _circle(draw, cx + 8, cy + 1, 4.2, "#1f2937")
+    _circle(draw, cx + 6.5, cy - 0.5, 1.6, "#ffffff")
+    _circle(draw, cx + 9, cy + 2.5, 0.9, "#ffffff")
+    draw.arc(
+        [(cx - 13) * SCALE, (cy - 7) * SCALE, (cx - 3) * SCALE, (cy - 1) * SCALE],
+        start=200,
+        end=350,
+        fill="#1f2937",
+        width=round(1.5 * SCALE),
+    )
+    draw.arc(
+        [(cx + 3) * SCALE, (cy - 8) * SCALE, (cx + 13) * SCALE, (cy - 2) * SCALE],
+        start=190,
+        end=340,
+        fill="#1f2937",
+        width=round(1.5 * SCALE),
+    )
+    _circle(draw, cx - 13, cy + 7, 4.2, "#fca5a5")
+    _circle(draw, cx + 13, cy + 7, 4.2, "#fca5a5")
+    _poly(draw, [(cx - 4, cy + 10), (cx + 4, cy + 10), (cx, cy + 14)], "#e11d48")
+    _circle(draw, cx + 13, cy + 17, 6, "#ffedd5")
+    _circle(draw, cx + 15, cy + 13, 3.5, "#fed7aa")
+    _circle(draw, cx - 24, cy - 16, 8, "#fef3c7")
+    draw.line(
+        [(cx - 24) * SCALE, (cy - 21) * SCALE, (cx - 24) * SCALE, (cy - 17) * SCALE],
+        fill="#d97706",
+        width=2 * SCALE,
+    )
+    _circle(draw, cx - 24, cy - 14, 1.1, "#d97706")
+
+
+def _draw_cut2_character(draw: ImageDraw.ImageDraw, cx: float, cy: float) -> None:
+    """2컷: 대만족 표정 캐릭터 (웃는 눈, 엄지 척, 반짝이)."""
+    _circle(draw, cx, cy - 6, 26, "#2d3748")
+    _circle(draw, cx - 16, cy, 13, "#2d3748")
+    _circle(draw, cx + 16, cy, 13, "#2d3748")
+    _round(draw, int(cx - 22), int(cy + 22), 44, 28, ACCENT, radius=10)
+    _poly(draw, [(cx - 6, cy + 22), (cx, cy + 28), (cx + 6, cy + 22)], "#ffffff")
+    _circle(draw, cx - 20, cy + 2, 5.5, "#ffedd5")
+    _circle(draw, cx + 20, cy + 2, 5.5, "#ffedd5")
+    _circle(draw, cx, cy + 2, 20, "#ffedd5")
+    _circle(draw, cx - 9, cy - 13, 14, "#2d3748")
+    _circle(draw, cx + 9, cy - 13, 14, "#2d3748")
+    _circle(draw, cx, cy - 15, 15, "#2d3748")
+    draw.arc(
+        [(cx - 13) * SCALE, (cy - 4) * SCALE, (cx - 3) * SCALE, (cy + 6) * SCALE],
+        start=200,
+        end=340,
+        fill="#1f2937",
+        width=round(2.2 * SCALE),
+    )
+    draw.arc(
+        [(cx + 3) * SCALE, (cy - 4) * SCALE, (cx + 13) * SCALE, (cy + 6) * SCALE],
+        start=200,
+        end=340,
+        fill="#1f2937",
+        width=round(2.2 * SCALE),
+    )
+    draw.arc(
+        [(cx - 14) * SCALE, (cy - 8) * SCALE, (cx - 4) * SCALE, (cy - 2) * SCALE],
+        start=200,
+        end=340,
+        fill="#1f2937",
+        width=round(1.5 * SCALE),
+    )
+    draw.arc(
+        [(cx + 4) * SCALE, (cy - 8) * SCALE, (cx + 14) * SCALE, (cy - 2) * SCALE],
+        start=200,
+        end=340,
+        fill="#1f2937",
+        width=round(1.5 * SCALE),
+    )
+    _circle(draw, cx - 13, cy + 8, 5, "#fda4af")
+    _circle(draw, cx + 13, cy + 8, 5, "#fda4af")
+    draw.pieslice(
+        [(cx - 6) * SCALE, (cy + 6) * SCALE, (cx + 6) * SCALE, (cy + 17) * SCALE],
+        start=0,
+        end=180,
+        fill="#e11d48",
+    )
+    _round(draw, int(cx - 4), int(cy + 7), 8, 3, "#ffffff", radius=1)
+    _round(draw, int(cx + 15), int(cy + 15), 13, 12, "#ffedd5", radius=4)
+    _round(draw, int(cx + 20), int(cy + 5), 7, 13, "#ffedd5", radius=3)
+    draw.line(
+        [(cx + 20) * SCALE, (cy + 12) * SCALE, (cx + 26) * SCALE, (cy + 12) * SCALE],
+        fill="#fed7aa",
+        width=round(1.5 * SCALE),
+    )
+    _mini_star(draw, cx - 26, cy - 13, "#f59e0b")
+    _mini_star(draw, cx + 26, cy - 15, "#10b981")
+
+
+def _mini_star(draw: ImageDraw.ImageDraw, scx: float, scy: float, color: str) -> None:
+    draw.polygon([
+        (scx * SCALE, (scy - 6) * SCALE),
+        ((scx + 2) * SCALE, (scy - 2) * SCALE),
+        ((scx + 6) * SCALE, scy * SCALE),
+        ((scx + 2) * SCALE, (scy + 2) * SCALE),
+        (scx * SCALE, (scy + 6) * SCALE),
+        ((scx - 2) * SCALE, (scy + 2) * SCALE),
+        ((scx - 6) * SCALE, scy * SCALE),
+        ((scx - 2) * SCALE, (scy - 2) * SCALE),
+    ], fill=color)
 
 
 def _circle(draw: ImageDraw.ImageDraw, cx: float, cy: float, r: float, color: str) -> None:
