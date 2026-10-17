@@ -10,6 +10,9 @@
     python main.py tistory-login                티스토리(카카오) 로그인을 한 번 저장
     python main.py upload --md 제안.md          수정 제안 마크다운으로 article 을 다시 쓴 뒤 올리기
     python main.py post --each --url A --url B  상품마다 한 글씩 순서대로 올리기
+    python main.py post --resume output/폴더    실패한 단계부터 이어서 만들기
+    python main.py rewrite --from output/폴더 --section tips --title   특정 섹션·제목만 다시 쓰기
+    python main.py compare --from output/폴더  예전 방식과 새 방식 결과 비교
 """
 
 from __future__ import annotations
@@ -23,11 +26,13 @@ import webbrowser
 from pathlib import Path
 
 from rich.console import Console
+from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 
 import config
 from ai.client import AIError, MyGenAssistClient
+from ai.staged import SECTION_ORDER, StageError
 from core.models import KIND_CTA, KIND_HEADING, KIND_IMAGE, KIND_LINK, FocusChoice, FocusPoint
 from pipeline import MAX_PRODUCTS, Pipeline, PipelineResult
 from scrape.product import ProductUnavailable
@@ -48,8 +53,16 @@ def main() -> int:
 
     post = sub.add_parser("post", help="상품 URL 로 리뷰 생성")
     post.add_argument(
-        "--url", action="append", required=True, dest="urls",
+        "--url", action="append", default=[], dest="urls",
         help="본문에 넣을 구매 링크. 여러 번 주면 묶어 한 글로 쓴다 (최대 4개). --each 와 같이 주면 한 글씩 쓴다",
+    )
+    post.add_argument(
+        "--resume", default="", metavar="폴더",
+        help="실패한 결과 폴더를 저장된 단계부터 이어서 만든다 (--url 불필요)",
+    )
+    post.add_argument(
+        "--writer", choices=config.WRITER_MODES, default="",
+        help="글 작성 방식. staged(단계별, 기본) 또는 legacy(예전 방식). .env 의 WRITER_MODE 보다 우선",
     )
     post.add_argument(
         "--each", action="store_true",
@@ -84,6 +97,18 @@ def main() -> int:
 
     sub.add_parser("tistory-login", help="티스토리 카카오 로그인을 한 번 저장")
 
+    rewrite = sub.add_parser("rewrite", help="단계별로 만든 결과에서 특정 섹션이나 제목만 다시 쓴다 (업로드하지 않음)")
+    rewrite.add_argument("--from", dest="run_dir", required=True, help="결과 폴더")
+    rewrite.add_argument(
+        "--section", action="append", default=[], dest="sections", choices=SECTION_ORDER,
+        help="다시 쓸 섹션. 여러 번 줄 수 있다",
+    )
+    rewrite.add_argument("--title", action="store_true", help="제목만 다시 제안받아 1순위를 쓴다")
+    rewrite.add_argument("--open", action="store_true", help="완성된 HTML 미리보기를 브라우저로 열기")
+
+    compare = sub.add_parser("compare", help="같은 상품으로 예전 방식 원고를 만들어 새 방식과 비교한다 (AI 호출 발생)")
+    compare.add_argument("--from", dest="run_dir", required=True, help="단계별로 만든 결과 폴더")
+
     args = parser.parse_args()
 
     try:
@@ -93,6 +118,10 @@ def main() -> int:
             return cmd_tistory_login()
         if args.command == "upload":
             return cmd_upload(args)
+        if args.command == "rewrite":
+            return cmd_rewrite(args)
+        if args.command == "compare":
+            return cmd_compare(args)
         return cmd_post(args)
     except KeyboardInterrupt:
         console.print("\n[yellow]중단되었습니다.[/yellow]")
@@ -115,6 +144,11 @@ def main() -> int:
         console.print()
         console.print(Panel(str(exc), title="상품 정보를 가져오지 못했습니다",
                             title_align="left", border_style="red"))
+        return 1
+    except StageError as exc:
+        console.print(f"\n[red]오류:[/red] {explain(exc)}")
+        console.print("  완료된 단계는 결과 폴더의 stages/ 에 저장되어 있습니다.")
+        console.print("  이어서 만들려면: [white]python main.py post --resume output/<결과 폴더>[/white]")
         return 1
     except (AIError, RuntimeError) as exc:
         console.print(f"\n[red]오류:[/red] {explain(exc)}")
@@ -171,6 +205,17 @@ def cmd_doctor() -> int:
     q = config.load_quality_config()
     table.add_row("품질 기준", f"{q.pass_mark}점 이상, 최대 {q.max_attempts}회 재생성, 휴머나이징 {'ON' if q.humanize else 'OFF'}")
 
+    w = config.load_writer_config()
+    try:
+        w.validate()
+        table.add_row(
+            "글 작성 방식",
+            f"{w.mode} (섹션 {w.section_batch}개씩, 수정 최대 {w.max_fix_rounds}회, AI 검수 {'ON' if w.ai_review else 'OFF'})"
+            if w.mode == "staged" else "legacy (예전 방식)",
+        )
+    except config.ConfigError as exc:
+        table.add_row("글 작성 방식", f"[red]{exc}[/red]")
+
     naver_cfg = config.load_naver_config()
     try:
         naver_cfg.validate()
@@ -210,14 +255,22 @@ def cmd_doctor() -> int:
 
 def cmd_post(args) -> int:
     pipeline = Pipeline(
-        report=lambda msg: console.print(f"  {msg}" if msg.startswith(" ") else f"[cyan]›[/cyan] {msg}"),
+        report=_report,
         choose=(lambda options: FocusChoice(point=options[0])) if args.auto_focus else _choose_focus,
         handoff=_handoff,
         handoff_on_block=args.browser,
         ask_page_url=_ask_page_url,
+        writer_mode=args.writer,
     )
 
+    if args.resume:
+        result = pipeline.resume(_resolve_run_dir(args.resume))
+        return _finish_post(result, args)
+
     urls = args.urls
+    if not urls:
+        console.print("[red]--url 로 구매 링크를 넣거나, --resume 으로 이어서 만들 결과 폴더를 주세요.[/red]")
+        return 1
     if args.each and len(urls) > 1:
         return _post_each(pipeline, args)
     if len(urls) > MAX_PRODUCTS:
@@ -357,6 +410,54 @@ def _finish_post(result: PipelineResult, args) -> int:
         tistory_only=args.tistory_only,
         no_tistory=args.no_tistory,
     )
+
+
+def cmd_rewrite(args) -> int:
+    if not args.sections and not args.title:
+        console.print(f"[red]--section 또는 --title 을 주세요.[/red] 섹션: {', '.join(SECTION_ORDER)}")
+        return 1
+    pipeline = Pipeline(report=_report, writer_mode="staged")
+    result = pipeline.resume(_resolve_run_dir(args.run_dir), sections=args.sections, title=args.title)
+    _show_report(result)
+    console.print(f"\n결과 저장 위치: [white]{result.run_dir}[/white]")
+    console.print(f"  올리려면: [white]python main.py upload --from {result.run_dir}[/white]")
+    if args.open:
+        webbrowser.open((result.run_dir / "article.html").as_uri())
+    return 0
+
+
+def cmd_compare(args) -> int:
+    pipeline = Pipeline(report=_report, writer_mode="legacy")
+    run_dir = _resolve_run_dir(args.run_dir)
+    rows = pipeline.compare(run_dir)
+
+    labels = [
+        ("title", "제목"), ("chars", "본문 글자 수"), ("quality_total", "품질 총점(AI 평가)"),
+        ("seo_score", "SEO 점수"), ("humanness", "문체 자연스러움(0~100)"),
+        ("check_issues", "코드 검수 지적 수"), ("check_issue_kinds", "지적 종류"), ("ai_calls", "AI 호출 수"),
+    ]
+    table = Table("항목", "새 방식(staged)", "예전 방식(legacy)", title="방식 비교", title_justify="left")
+    for key, label in labels:
+        new, old = rows["staged"].get(key), rows["legacy"].get(key)
+        fmt = lambda v: ", ".join(f"{k} {n}" for k, n in v.items()) if isinstance(v, dict) else ("-" if v is None else str(v))
+        table.add_row(label, fmt(new), fmt(old))
+    console.print(table)
+    console.print(f"\n예전 방식 원고: [white]{run_dir / 'compare_legacy.html'}[/white]")
+    console.print(f"비교 결과: [white]{run_dir / 'compare.json'}[/white]")
+    return 0
+
+
+def _report(msg: str) -> None:
+    console.print(f"  {msg}" if msg.startswith(" ") else f"[cyan]›[/cyan] {msg}")
+
+
+def _resolve_run_dir(value: str) -> Path:
+    path = Path(value)
+    if not path.exists():
+        path = config.ROOT / value
+    if not path.exists():
+        raise FileNotFoundError(value)
+    return path
 
 
 def cmd_upload(args) -> int:
@@ -794,6 +895,18 @@ def _show_report(result: PipelineResult) -> None:
     if result.focus:
         console.print(Panel(f"{result.focus.title}\n[dim]{result.focus.angle}[/dim]",
                             title="집중 포인트", title_align="left", border_style="cyan"))
+    if result.staged:
+        staged = result.staged
+        titles = "\n".join(
+            f"{'[green]→[/green]' if i == staged.titles.chosen else ' '} {i + 1}. {escape(o.title)}"
+            for i, o in enumerate(staged.titles.options)
+        )
+        console.print(Panel(
+            f"[bold]핵심 메시지[/bold] {escape(staged.message.message)}\n\n[bold]제목 제안[/bold]\n{titles}\n\n"
+            f"[bold]메타 설명[/bold] {escape(staged.outline.meta_description)}\n"
+            f"[bold]해시태그[/bold] {escape(' '.join('#' + t for t in staged.outline.hashtags))}",
+            title="단계별 집필 결과", title_align="left", border_style="cyan",
+        ))
     console.print(quality)
     console.print(seo_table)
     console.print(structure)
@@ -801,6 +914,11 @@ def _show_report(result: PipelineResult) -> None:
     if draft.quality.feedback:
         console.print(Panel("\n".join(f"· {f}" for f in draft.quality.feedback),
                             title="남은 개선 여지", border_style="yellow"))
+    if result.staged and result.staged.remaining:
+        console.print(Panel(
+            "\n".join(f"· {escape(f'[{i.key}] {i.reason}')}" for i in result.staged.remaining),
+            title="자동 수정 후에도 남은 검수 지적", border_style="yellow",
+        ))
 
 
 def _ask(prompt: str, valid: tuple[str, ...]) -> str:

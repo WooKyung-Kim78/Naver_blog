@@ -131,6 +131,24 @@ class QualityConfig:
     humanize: bool
 
 
+WRITER_MODES = ("staged", "legacy")
+
+
+@dataclass
+class WriterConfig:
+    """staged 는 단계별 집필, legacy 는 예전 방식(앞·뒷부분 한 번에 쓰고 채점·수정)."""
+
+    mode: str = "staged"
+    #: 한 번의 호출로 쓸 섹션 수. 늘리면 호출은 줄고 섹션마다 집중도는 떨어진다.
+    section_batch: int = 3
+    max_fix_rounds: int = 2
+    ai_review: bool = True
+
+    def validate(self) -> None:
+        if self.mode not in WRITER_MODES:
+            raise ConfigError("WRITER_MODE 는 staged 또는 legacy 여야 합니다.")
+
+
 @dataclass
 class NaverConfig:
     user_id: str
@@ -276,6 +294,15 @@ def load_quality_config() -> QualityConfig:
         pass_mark=_get_int("QUALITY_PASS_MARK", 80),
         max_attempts=_get_int("QUALITY_MAX_ATTEMPTS", 3),
         humanize=_get_bool("HUMANIZE", True),
+    )
+
+
+def load_writer_config() -> WriterConfig:
+    return WriterConfig(
+        mode=_get("WRITER_MODE", "staged").lower(),
+        section_batch=max(1, _get_int("STAGED_SECTION_BATCH", 3)),
+        max_fix_rounds=max(0, _get_int("STAGED_MAX_FIX_ROUNDS", 2)),
+        ai_review=_get_bool("STAGED_AI_REVIEW", True),
     )
 
 

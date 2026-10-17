@@ -39,6 +39,8 @@ class MyGenAssistClient:
         if cfg.proxies:
             self.session.proxies.update(cfg.proxies)
         self.session.verify = cfg.verify_ssl
+        #: 이 클라이언트로 보낸 AI 호출 수. 방식별 비용 비교에 쓴다.
+        self.calls = 0
 
     def ping(self) -> dict:
         """선택한 제공자의 인증 및 API 접근 가능 여부를 확인한다."""
@@ -81,6 +83,7 @@ class MyGenAssistClient:
             )
 
         last_error: Exception | None = None
+        self.calls += 1
         for attempt in range(retries + 1):
             try:
                 resp = self.session.post(self.cfg.url, json=payload, timeout=300)

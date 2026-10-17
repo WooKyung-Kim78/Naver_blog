@@ -367,6 +367,103 @@ class HumannessReport:
         return "\n".join(lines)
 
 
+# ------------------------------------------------------------- 단계별 집필
+
+
+@dataclass
+class Fact:
+    id: str = ""
+    text: str = ""
+    quote: str = ""  # 근거가 된 원문 그대로
+    source: str = "text"  # text / image / spec / price
+
+
+@dataclass
+class ProductFacts:
+    """1단계. 원문에서 확인된 사실만 남긴 목록. 이후 단계는 이것만 근거로 쓴다."""
+
+    name: str = ""
+    category: str = ""
+    summary: str = ""
+    facts: list[Fact] = field(default_factory=list)
+    unknowns: list[str] = field(default_factory=list)
+    cautions: list[str] = field(default_factory=list)
+    dropped: list[str] = field(default_factory=list)  # 원문에서 근거를 찾지 못해 뺀 주장
+
+    def as_prompt(self) -> str:
+        lines = [f"[상품명] {self.name}", f"[카테고리] {self.category}", f"[요약] {self.summary}", "[확인된 사실]"]
+        lines += [f"  {f.id}. {f.text}" for f in self.facts]
+        if self.unknowns:
+            lines.append(f"[상품 정보로 확인할 수 없는 것] {' / '.join(self.unknowns)}")
+        if self.cautions:
+            lines.append(f"[쓰면 안 되는 주장] {' / '.join(self.cautions)}")
+        return "\n".join(lines)
+
+
+@dataclass
+class MessagePlan:
+    """3단계. 글 전체가 수렴할 핵심 메시지."""
+
+    customer: str = ""
+    situation: str = ""
+    search_intent: str = ""
+    message: str = ""
+    reasons: list[str] = field(default_factory=list)
+    fact_ids: list[str] = field(default_factory=list)
+    tone: str = ""
+
+
+@dataclass
+class SectionPlan:
+    id: str = ""
+    heading: str = ""
+    goal: str = ""
+    points: list[str] = field(default_factory=list)
+    fact_ids: list[str] = field(default_factory=list)
+    keywords: list[str] = field(default_factory=list)
+
+
+@dataclass
+class Outline:
+    """4단계. 섹션 순서는 파이썬이 고정하고, 소제목과 다룰 내용만 AI 가 정한다."""
+
+    sections: list[SectionPlan] = field(default_factory=list)
+    meta_description: str = ""
+    hashtags: list[str] = field(default_factory=list)
+
+    def get(self, section_id: str) -> SectionPlan | None:
+        return next((s for s in self.sections if s.id == section_id), None)
+
+
+@dataclass
+class SectionDraft:
+    """5단계 이후 섹션 하나의 본문. 서식은 조립 단계에서 파이썬이 입힌다."""
+
+    id: str = ""
+    heading: str = ""
+    paragraphs: list[str] = field(default_factory=list)
+    items: list[str] = field(default_factory=list)
+    extra_items: list[str] = field(default_factory=list)
+    rows: list[list[str]] = field(default_factory=list)  # [특징, 내용, 고객 이점]
+    scenes: list[list[str]] = field(default_factory=list)  # [소제목, 본문]
+    closing: str = ""
+
+
+@dataclass
+class ReviewIssue:
+    key: str = ""  # "섹션/단위". 예: features/p1, checks/i0
+    type: str = ""  # fact / exaggeration / pressure / experience / number / keyword / repetition / readability / flow / seo
+    reason: str = ""
+    suggestion: str = ""
+    origin: str = "check"  # check(코드 검사) / ai
+
+
+@dataclass
+class TitleOption:
+    title: str = ""
+    reason: str = ""
+
+
 @dataclass
 class Draft:
     """한 번의 생성 시도 결과 묶음."""

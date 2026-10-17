@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import json
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Callable
@@ -29,6 +29,9 @@ from typing import Callable
 import config
 from ai import analyst, critic, focus as focus_mod, humanizer, image_screen, reviser, roundup as roundup_mod, seo as seo_mod, writer
 from ai.client import MyGenAssistClient
+from ai.staged import StagedResult, StagedWriter
+from ai.staged import checks as staged_checks, steps as staged_steps
+from core.checkpoint import Checkpoint, from_data
 from core.models import (
     KIND_CALLOUT,
     KIND_CTA,
@@ -91,6 +94,7 @@ class PipelineResult:
     attempts: list[Draft]
     products: list[Product] | None = None
     roundup: RoundupBrief | None = None
+    staged: StagedResult | None = None
 
 
 class Pipeline:
@@ -102,6 +106,7 @@ class Pipeline:
         handoff: Handoff | None = None,
         handoff_on_block: bool = False,
         ask_page_url: PageAsker | None = None,
+        writer_mode: str = "",
     ):
         self.report = report or (lambda _: None)
         # 콜백이 없으면 첫 번째 안을 자동 선택한다 (비대화형 실행용).
@@ -118,6 +123,10 @@ class Pipeline:
         self.gen_cfg = config.load_imagegen_config()
         self.post_cfg = config.load_post_config()
         self.quality_cfg = config.load_quality_config()
+        self.writer_cfg = config.load_writer_config()
+        if writer_mode:
+            self.writer_cfg.mode = writer_mode
+        self.writer_cfg.validate()
         self.client = MyGenAssistClient(self.ai_cfg)
         self._processor = ImageProcessor(verify_ssl=self.ai_cfg.verify_ssl, proxies=self.ai_cfg.proxies)
 
@@ -143,33 +152,187 @@ class Pipeline:
         stamp = f"{datetime.now():%Y%m%d_%H%M%S}"
         run_dir = config.OUTPUT_DIR / f"{stamp}_{_slug(product.title)}"
         available = self._prepare_images(product, run_dir)
+        Checkpoint(run_dir).save_product(product, available)
 
-        self.report("상품 분석 중 (특징·타깃·시나리오·장단점·추천대상)")
-        brief = analyst.analyze(self.client, product)
-        self.report(
-            f"  카테고리: {brief.category} / 특징 {len(brief.features)}개 / "
-            f"추천대상 {len(brief.recommended_for)}개"
+        return self._generate(product, available, run_dir, stamp)
+
+    def resume(
+        self,
+        run_dir: Path,
+        *,
+        sections: list[str] | None = None,
+        title: bool = False,
+    ) -> PipelineResult:
+        """저장된 단계부터 이어서 만든다. sections/title 을 주면 그 부분만 다시 쓴다."""
+        run_dir = Path(run_dir).resolve()
+        loaded = Checkpoint(run_dir).load_product()
+        if loaded is None:
+            raise RuntimeError(
+                f"{run_dir} 에는 단계 저장본(stages/00_product.json)이 없습니다. "
+                "단계 저장 기능이 생긴 뒤에 만든 결과 폴더만 이어서 실행할 수 있습니다."
+            )
+        if (sections or title) and self.writer_cfg.mode != "staged":
+            raise RuntimeError("섹션·제목만 다시 쓰기는 WRITER_MODE=staged 에서만 됩니다.")
+        product, available = loaded
+        self.report(f"저장된 단계부터 이어서 실행합니다: {run_dir.name}")
+        return self._generate(product, available, run_dir, run_dir.name[:15], sections=sections, title=title)
+
+    def compare(self, run_dir: Path) -> dict:
+        """같은 분석·SEO 저장본으로 예전 방식 원고를 만들어, 이 폴더의 새 방식 원고와 재는 기준으로 비교한다.
+
+        예전 방식 원고는 compare_legacy.html 로만 남기고 article.json 은 건드리지 않는다.
+        """
+        from core.article_io import load_article
+
+        run_dir = Path(run_dir).resolve()
+        ckpt = Checkpoint(run_dir)
+        loaded = ckpt.load_product()
+        staged_article = load_article(run_dir)
+        if loaded is None or staged_article is None:
+            raise RuntimeError(f"{run_dir} 에 단계 저장본과 article.json 이 모두 있어야 비교할 수 있습니다.")
+        product, available = loaded
+        brief, focus, _, seo = self._analyze(product, available, ckpt)
+
+        report_path = run_dir / "report.json"
+        saved = json.loads(report_path.read_text(encoding="utf-8")) if report_path.exists() else {}
+        staged_quality = (saved.get("best") or {}).get("quality_total")
+
+        before = self.client.calls
+        self.report("예전 방식으로 같은 상품의 원고를 만드는 중")
+        legacy, _ = self._write_until_good(product, brief, seo, focus)
+        legacy_calls = self.client.calls - before
+
+        source = staged_steps.source_text(product, seo)
+        rows = {
+            "staged": _measure(staged_article, seo, source, staged_quality, saved.get("ai_calls")),
+            "legacy": _measure(legacy.article, seo, source, legacy.quality.total, legacy_calls),
+        }
+        (run_dir / "compare_legacy.html").write_text(
+            html_render.render(legacy.article, seo), encoding="utf-8"
         )
+        (run_dir / "compare.json").write_text(
+            json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        return rows
 
-        focus, options = self._pick_focus(product, brief, available)
+    def _generate(
+        self,
+        product: Product,
+        available: list[ImageAsset],
+        run_dir: Path,
+        stamp: str,
+        *,
+        sections: list[str] | None = None,
+        title: bool = False,
+    ) -> PipelineResult:
+        ckpt = Checkpoint(run_dir)
+        brief, focus, options, seo = self._analyze(product, available, ckpt)
 
-        self.report("SEO 키워드 전략 수립 중 (웹 검색 포함)")
-        seo = seo_mod.plan(self.client, product, brief, focus=focus)
-        self.report(f"  메인 키워드: {seo.main_keyword} ({seo.search_type}, 경쟁도 {seo.competition})")
-
-        draft, attempts = self._write_until_good(product, brief, seo, focus)
+        staged = None
+        if self.writer_cfg.mode == "staged":
+            draft, attempts, staged = self._write_staged(
+                product, brief, focus, seo, available, ckpt, sections=sections, title=title
+            )
+            audience = staged.sections.get("audience")
+            if audience and audience.items:
+                # 요약 그림의 추천·비추천을 본문과 같은 말로 맞춘다.
+                brief = replace(brief, recommended_for=audience.items,
+                                not_recommended_for=audience.extra_items or brief.not_recommended_for)
+            seo = replace(seo, meta_description=staged.outline.meta_description or seo.meta_description)
+        else:
+            draft, attempts = self._write_until_good(product, brief, seo, focus)
 
         images = self._place_images(product, brief, seo, draft.article, run_dir, available)
         run_dir = _rename_run_dir(run_dir, config.OUTPUT_DIR / f"{stamp}_{_slug(draft.article.title)}",
                                   draft.article, images)
 
         ops = naver_blocks.render(draft.article)
-        self._save(run_dir, product, brief, focus, options, seo, draft, attempts)
+        self._save(run_dir, product, brief, focus, options, seo, draft, attempts, staged=staged)
 
         return PipelineResult(
             product, brief, focus, options, seo, draft, images, ops, run_dir, attempts,
-            products=[product],
+            products=[product], staged=staged,
         )
+
+    def _analyze(
+        self, product: Product, available: list[ImageAsset], ckpt: Checkpoint
+    ) -> tuple[ProductBrief, FocusPoint | None, list[FocusPoint], SeoPlan]:
+        """상품 분석·집중 포인트·SEO. 이어서 실행할 때 다시 묻지 않게 저장해 둔다."""
+        data = ckpt.load("02_brief")
+        if data is not None:
+            brief = from_data(ProductBrief, data)
+            self.report("상품 분석 (저장본 사용)")
+        else:
+            self.report("상품 분석 중 (특징·타깃·시나리오·장단점·추천대상)")
+            brief = analyst.analyze(self.client, product)
+            self.report(
+                f"  카테고리: {brief.category} / 특징 {len(brief.features)}개 / "
+                f"추천대상 {len(brief.recommended_for)}개"
+            )
+            ckpt.save("02_brief", brief)
+
+        data = ckpt.load("02_focus")
+        if isinstance(data, dict):
+            focus = from_data(FocusPoint | None, data.get("focus"))
+            options = from_data(list[FocusPoint], data.get("options"))
+            self.report(f"집중 포인트 (저장본 사용): {focus.title if focus else '없음'}")
+        else:
+            focus, options = self._pick_focus(product, brief, available)
+            ckpt.save("02_focus", {"focus": focus, "options": options})
+
+        data = ckpt.load("02_seo")
+        if data is not None:
+            seo = from_data(SeoPlan, data)
+            self.report(f"SEO 키워드 전략 (저장본 사용): {seo.main_keyword}")
+        else:
+            self.report("SEO 키워드 전략 수립 중 (웹 검색 포함)")
+            seo = seo_mod.plan(self.client, product, brief, focus=focus)
+            self.report(f"  메인 키워드: {seo.main_keyword} ({seo.search_type}, 경쟁도 {seo.competition})")
+            ckpt.save("02_seo", seo)
+        return brief, focus, options, seo
+
+    def _write_staged(
+        self,
+        product: Product,
+        brief: ProductBrief,
+        focus: FocusPoint | None,
+        seo: SeoPlan,
+        available: list[ImageAsset],
+        ckpt: Checkpoint,
+        *,
+        sections: list[str] | None = None,
+        title: bool = False,
+    ) -> tuple[Draft, list[Draft], StagedResult]:
+        staged_writer = StagedWriter(
+            self.client, ckpt,
+            persona=self.post_cfg.persona,
+            disclosure=shopping_connect.disclosure_for([product.url], self.post_cfg.disclosure),
+            cfg=self.writer_cfg,
+            report=self.report,
+        )
+        images = self._vision_paths(available) if image_screen.can_see(self.client) else []
+        result = staged_writer.run(
+            product, brief, focus, seo, images=images, rewrite_sections=sections, rewrite_title=title,
+        )
+
+        article = result.article
+        seo_score = seo_mod.score(article, seo)
+        self.report("  품질 평가 중")
+        quality = critic.evaluate(self.client, article, brief, seo, seo_score)
+        draft = Draft(article=article, quality=quality, seo_score=seo_score,
+                      humanness=humanizer.measure(article.body_text()), attempt=1)
+        self.report(f"  총점 {quality.total}/100 (SEO {seo_score.total}, 본문 {article.char_count():,}자)")
+        return draft, [draft], result
+
+    @staticmethod
+    def _vision_paths(available: list[ImageAsset]) -> list[Path]:
+        """비전 호출은 장당 비용이 크다. 점수 높은 상세 이미지 몇 장만 보여준다."""
+        details = sorted(
+            (a for a in available if a.source == "detail" and a.path),
+            key=lambda a: a.score,
+            reverse=True,
+        )
+        return [a.path for a in details[: focus_mod.MAX_VISION_IMAGES]]
 
     def run_roundup(
         self,
@@ -480,12 +643,7 @@ class Pipeline:
         self, product: Product, brief: ProductBrief, available: list[ImageAsset]
     ) -> tuple[FocusPoint | None, list[FocusPoint]]:
         # 상세 이미지를 점수 순으로 몇 장만 보여준다. 비전 호출은 장당 비용이 크다.
-        details = sorted(
-            (a for a in available if a.source == "detail" and a.path),
-            key=lambda a: a.score,
-            reverse=True,
-        )
-        paths = [a.path for a in details[: focus_mod.MAX_VISION_IMAGES]]
+        paths = self._vision_paths(available)
 
         if paths:
             self.report(f"상세페이지 이미지 {len(paths)}장을 AI 가 직접 읽는 중")
@@ -856,6 +1014,7 @@ class Pipeline:
         *,
         products: list[Product] | None = None,
         combo: RoundupBrief | None = None,
+        staged: StagedResult | None = None,
     ) -> None:
         run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -915,6 +1074,9 @@ class Pipeline:
                     "best": draft.to_dict(),
                     "attempts": [d.to_dict() for d in attempts],
                     "humanness": draft.humanness.__dict__,
+                    "writer_mode": "staged" if staged else "legacy",
+                    "ai_calls": getattr(self.client, "calls", None),
+                    "staged": staged.report() if staged else None,
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -975,6 +1137,35 @@ def _rename_run_dir(
 def _stock_query(brief: ProductBrief, seo: SeoPlan) -> str:
     """스톡 사진 검색은 영어가 결과가 좋다. 카테고리 위주로 단순하게 만든다."""
     return brief.category or seo.main_keyword
+
+
+def _measure(article: Article, seo: SeoPlan, source: str, quality: int | None, calls: int | None) -> dict:
+    """두 방식을 같은 자로 잰다. 코드 검수는 섹션 구분 없이 본문 전체에 똑같이 돌린다."""
+    from core.models import KIND_CHECKLIST, SectionDraft
+
+    # 총평 박스는 요약 그림이 들어가면 본문에서 빠지므로 양쪽 모두 재지 않는다.
+    texts = [
+        b.plain_text for b in article.blocks
+        if b.plain_text and b.kind != KIND_CHECKLIST and b.text != article.disclosure
+        and not (b.kind == KIND_CALLOUT and b.style == "summary")
+    ]
+    items = [i for b in article.blocks if b.kind == KIND_CHECKLIST for i in b.items]
+    body = {"body": SectionDraft(id="body", paragraphs=texts, items=items)}
+    issues = staged_checks.run(body, source_text=source, seo=seo)
+    kinds: dict[str, int] = {}
+    for issue in issues:
+        kinds[issue.type] = kinds.get(issue.type, 0) + 1
+    style = humanizer.measure(article.body_text())
+    return {
+        "title": article.title,
+        "chars": article.char_count(),
+        "quality_total": quality,
+        "seo_score": seo_mod.score(article, seo).total,
+        "humanness": round(humanizer._grade(style), 1),
+        "check_issues": len(issues),
+        "check_issue_kinds": kinds,
+        "ai_calls": calls,
+    }
 
 
 def _slug(text: str) -> str:
