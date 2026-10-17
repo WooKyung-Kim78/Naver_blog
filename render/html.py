@@ -261,6 +261,12 @@ def render_tistory(article: Article, image_url) -> str:
     image_url(asset) 은 로컬 이미지를 공개 주소로 바꾼다. 빈 문자열이면 그 그림은 빠진다.
     """
     parts = [_tistory_block(block, image_url) for block in article.blocks]
+    disclosure = (article.disclosure or "").strip()
+    # 네이버와 달리 티스토리는 대가성 문구를 자동으로 붙이지 않는다.
+    if disclosure and not any(
+        b.kind == KIND_CALLOUT and b.text.strip() == disclosure for b in article.blocks
+    ):
+        parts.insert(0, f'<p style="color:#6b7280;font-size:14px;">{_br(disclosure)}</p>')
     return "\n".join(part for part in parts if part)
 
 
@@ -318,6 +324,9 @@ def _tistory_image(image, image_url) -> str:
     src = image_url(image) if image_url else ""
     if not src:
         return ""
+    if src.startswith("[##_"):
+        # 티스토리 사진 치환자는 그대로 둔다. 발행하면 티스토리가 figure 로 바꾼다.
+        return src
     alt = image.caption or "상품 이미지"
     caption = "" if image.source == "infographic" else (image.credit or image.caption)
     cap_html = (

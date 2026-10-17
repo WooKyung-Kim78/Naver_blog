@@ -32,7 +32,7 @@ from core.models import KIND_CTA, KIND_HEADING, KIND_IMAGE, KIND_LINK, FocusChoi
 from pipeline import MAX_PRODUCTS, Pipeline, PipelineResult
 from scrape.product import ProductUnavailable
 from publish.naver_blog import NaverBlogError
-from publish.tistory import TistoryError
+from publish.tistory import TistoryDailyLimit, TistoryError
 
 console = Console()
 
@@ -185,9 +185,10 @@ def cmd_doctor() -> int:
         try:
             tistory_cfg.validate()
             session = "세션 있음" if config.TISTORY_SESSION_FILE.exists() else "로그인 필요 (python main.py tistory-login)"
-            vis = "공개" if tistory_cfg.wants_public() else "비공개"
+            vis = "임시저장" if tistory_cfg.wants_draft() else ("공개" if tistory_cfg.wants_public() else "비공개")
             cat = tistory_cfg.category or "기본 카테고리"
-            table.add_row("티스토리", f"[green]{tistory_cfg.blog_name}[/green] / {cat} / {vis} / {session}")
+            body = "원고 전체" if tistory_cfg.wants_full() else "네이버 링크만"
+            table.add_row("티스토리", f"[green]{tistory_cfg.blog_name}[/green] / {cat} / {vis} / {body} / {session}")
         except config.ConfigError as exc:
             table.add_row("티스토리", f"[red]{exc}[/red]")
 
@@ -251,8 +252,12 @@ def _post_each(pipeline: Pipeline, args) -> int:
         args.md_path = ""
     pages = args.page_urls if len(args.page_urls) == len(urls) else [""] * len(urls)
 
+    if not args.dry_run:
+        _check_logins(args)
+
     done: list[tuple[int, str, str]] = []
     failed: list[tuple[int, str, str]] = []
+    tistory_pending: list[Path] = []
     for i, (buy, page) in enumerate(zip(urls, pages), 1):
         console.print()
         console.rule(f"[bold]{i}/{len(urls)}[/bold]  {buy}")
@@ -260,10 +265,22 @@ def _post_each(pipeline: Pipeline, args) -> int:
             result = pipeline.run(buy, page_url=page, manual_desc="", collect_images=not args.no_images)
             _finish_post(result, args)
             done.append((i, buy, result.draft.article.title))
+        except TistoryDailyLimit:
+            done.append((i, buy, f"{result.draft.article.title} [yellow](티스토리 보류)[/yellow]"))
+            tistory_pending.append(result.run_dir)
+            if args.tistory_only:
+                console.print("[yellow]티스토리 하루 한도에 걸려 남은 상품은 진행하지 않습니다.[/yellow]")
+                break
+            if not args.no_tistory:
+                console.print("[yellow]티스토리 하루 한도에 걸렸습니다. 남은 글은 네이버에만 올리고 티스토리는 보류합니다.[/yellow]")
+                args.no_tistory = True
         except (ProductUnavailable, NaverBlogError, TistoryError, AIError, RuntimeError) as exc:
             console.print(Panel(explain(exc), title=f"{i}번 상품 실패, 다음 상품으로 넘어갑니다",
                                 title_align="left", border_style="red"))
             failed.append((i, buy, explain(exc).splitlines()[0]))
+        else:
+            if args.no_tistory and tistory_pending and not args.dry_run:
+                tistory_pending.append(result.run_dir)
 
     summary = Table("#", "구매 링크", "결과", title="순차 포스팅 결과", title_justify="left")
     for i, buy, title in done:
@@ -272,7 +289,44 @@ def _post_each(pipeline: Pipeline, args) -> int:
         summary.add_row(str(i), buy, f"[red]실패[/red] {reason}")
     console.print()
     console.print(summary)
+    if tistory_pending:
+        console.print("\n[yellow]티스토리 하루 공개 발행 한도(15개) 때문에 아래 글은 티스토리에 올리지 못했습니다.[/yellow]")
+        console.print("  내일 아래 명령으로 올리세요.")
+        for run_dir in tistory_pending:
+            console.print(f"  python main.py upload --from \"{run_dir}\" --tistory-only")
     return 1 if failed else 0
+
+
+def _check_logins(args) -> None:
+    """상품 리뷰를 만들기 전에 올릴 곳의 로그인을 확인한다. 실패하면 예외로 멈춘다."""
+    if args.tistory_only and args.no_tistory:
+        raise config.ConfigError("--tistory-only 와 --no-tistory 를 같이 쓸 수 없습니다.")
+
+    console.print()
+    console.rule("[bold]로그인 확인[/bold]")
+    if not args.tistory_only:
+        from publish.naver_blog import NaverBlogPublisher
+
+        naver_cfg = config.load_naver_config()
+        naver_cfg.validate()
+        console.print("[cyan]›[/cyan] 네이버 로그인 확인 중")
+        with NaverBlogPublisher(naver_cfg, debug=args.debug) as publisher:
+            publisher.ensure_login()
+        console.print("[green]  네이버 로그인됨[/green]")
+
+    tistory_cfg = config.load_tistory_config()
+    if args.tistory_only and not tistory_cfg.blog_name:
+        raise config.ConfigError(
+            "TISTORY_BLOG_NAME 이 비어 있습니다. .env 에 블로그 이름(wkkim97)을 넣은 뒤 다시 실행하세요."
+        )
+    if not args.no_tistory and tistory_cfg.blog_name:
+        from publish.tistory import TistoryPublisher
+
+        tistory_cfg.validate()
+        console.print("[cyan]›[/cyan] 티스토리 로그인 확인 중")
+        with TistoryPublisher(tistory_cfg, debug=args.debug) as publisher:
+            publisher.ensure_login()
+        console.print("[green]  티스토리 로그인됨[/green]")
 
 
 def _finish_post(result: PipelineResult, args) -> int:
@@ -381,15 +435,17 @@ def _upload(
     if do_tistory:
         saved = run_dir / "naver.url"
         naver_url = saved.read_text(encoding="utf-8").strip() if saved.exists() else ""
-        if not naver_url:
+        if not naver_url and not tistory_cfg.wants_full():
             # 발행 후 글 주소를 얻지 못했을 때만 묻는다.
             naver_url = _ask_naver_url(run_dir)
-        if not naver_url:
+        if not naver_url and not tistory_cfg.wants_full():
             console.print("\n[yellow]티스토리는 건너뛰었습니다.[/yellow]")
             console.print(f"  나중에 올리려면: python main.py upload --from {run_dir} --tistory-only")
             return 0
         try:
-            tistory_message = _publish_tistory(title, tags, naver_url, run_dir=run_dir, debug=debug, cfg=tistory_cfg)
+            tistory_message = _publish_tistory(
+                title, tags, naver_url, run_dir=run_dir, debug=debug, cfg=tistory_cfg, payload=payload
+            )
         except TistoryError:
             if naver_message:
                 console.print(f"\n[yellow]네이버에는 올라갔습니다.[/yellow] {naver_message}")
@@ -460,27 +516,54 @@ def _is_naver_post_url(url: str) -> bool:
     return "postwrite" not in url.lower() and "redirect=write" not in url.lower()
 
 
-def _publish_tistory(title, tags, naver_url: str, *, run_dir, debug: bool, cfg) -> str:
+def _publish_tistory(title, tags, naver_url: str, *, run_dir, debug: bool, cfg, payload=None) -> str:
     from publish.tistory import TistoryPublisher
 
     cfg.validate()
-    vis = "공개 발행" if cfg.wants_public() else "비공개 저장"
+    if cfg.wants_draft():
+        vis = "임시저장"
+    else:
+        vis = "공개 발행" if cfg.wants_public() else "비공개 저장"
+    article = _tistory_article(run_dir, title, tags, payload) if cfg.wants_full() else None
     try:
         with TistoryPublisher(cfg, debug=debug) as publisher:
             console.print(f"[cyan]›[/cyan] 티스토리 {vis} 중 ({cfg.category or '기본 카테고리'})")
-            url = publisher.publish(title, naver_url, tags)
+            url = publisher.publish(title, naver_url, tags, article=article)
     except TistoryError:
         console.print(f"\n[yellow]원고는 그대로 있습니다.[/yellow] 다시 올리려면:")
         console.print(f"  python main.py upload --from {run_dir} --tistory-only")
         raise
 
+    if cfg.wants_draft():
+        return f"티스토리 임시저장 완료: {url}"
     (run_dir / "tistory.url").write_text(url + "\n", encoding="utf-8")
     if cfg.wants_public():
-        return (
-            f"티스토리 발행 완료: {url}\n"
-            f"  본문 링크: {naver_url}"
-        )
+        link = f"\n  본문 링크: {naver_url}" if article is None else ""
+        return f"티스토리 발행 완료: {url}{link}"
     return f"티스토리 비공개 저장: {url}"
+
+
+def _tistory_article(run_dir, title: str, tags: list[str], payload):
+    """네이버에 올린 것과 같은 원고. 못 읽으면 None 을 돌려 링크만 올린다."""
+    from publish.review import resolve_article
+
+    try:
+        article = resolve_article(Path(run_dir), title, tags, payload or [])
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        console.print(f"[yellow]  원고를 읽지 못해 티스토리에는 네이버 글 링크만 올립니다:[/yellow] {exc}")
+        return None
+    if not article.blocks:
+        return None
+    article.title = title or article.title
+    article.tags = tags or article.tags
+    images = Path(run_dir) / "images"
+    for block in article.blocks:
+        # 결과 폴더를 옮겨도 사진을 찾는다.
+        if block.image and block.image.path and not block.image.path.exists():
+            moved = images / block.image.path.name
+            if moved.exists():
+                block.image.path = moved
+    return article
 
 
 def _review_before_upload(run_dir, title: str, tags: list[str], payload, *, md_path: str):

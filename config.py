@@ -167,10 +167,20 @@ class TistoryConfig:
     visibility: str
     post_mode: str
     headed: bool
+    #: full 이면 네이버와 같은 원고를, link 이면 네이버 글 링크만 올린다.
+    content: str = "full"
+    #: draft 면 임시저장만, publish 면 발행한다.
+    save_mode: str = "draft"
 
     @property
     def home(self) -> str:
         return f"https://{self.blog_name}.tistory.com"
+
+    def wants_draft(self) -> bool:
+        return self.save_mode != "publish"
+
+    def wants_full(self) -> bool:
+        return self.content != "link"
 
     def wants_public(self) -> bool:
         if self.visibility == "3":
@@ -186,6 +196,10 @@ class TistoryConfig:
             )
         if self.visibility and self.visibility not in ("0", "3"):
             raise ConfigError("TISTORY_VISIBILITY 는 비우거나 0(비공개), 3(공개) 이어야 합니다.")
+        if self.content not in ("full", "link"):
+            raise ConfigError("TISTORY_CONTENT 는 full(네이버와 같은 원고) 또는 link(네이버 글 링크만) 이어야 합니다.")
+        if self.save_mode not in ("draft", "publish"):
+            raise ConfigError("TISTORY_POST_MODE 는 draft(임시저장) 또는 publish(발행) 여야 합니다.")
 
 
 @dataclass
@@ -296,6 +310,8 @@ def load_tistory_config() -> TistoryConfig:
         visibility=_get("TISTORY_VISIBILITY"),
         post_mode=_get("POST_MODE", "publish").lower(),
         headed=_get_bool("BROWSER_HEADED", True),
+        content=_get("TISTORY_CONTENT", "full").lower(),
+        save_mode=_get("TISTORY_POST_MODE", "draft").lower(),
     )
 
 

@@ -1,15 +1,21 @@
 """Playwright 로 티스토리에 글을 올린다.
 
-티스토리 Open API 는 종료되었다. 네이버에 발행한 글의 제목과 링크, 태그만 넣어 발행한다.
+티스토리 Open API 는 종료되었다. 네이버와 같은 원고를 HTML 로 바꿔 넣고, 사진은 글쓰기
+화면이 쓰는 첨부 주소로 올린다. TISTORY_CONTENT=link 이면 예전처럼 네이버 글 링크만 넣는다.
 본문은 글쓰기 화면의 HTML 모드에 넣고, 그 모드 그대로 발행한다.
 로그인 세션은 storage/tistory_session.json 에 저장한다. 네이버 세션과는 별개다.
 """
 
 from __future__ import annotations
 
+import base64
+import json
+import mimetypes
 import re
 import time
 from html import escape
+from pathlib import Path
+from urllib.parse import urlparse
 
 from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import Page, TimeoutError as PlaywrightTimeout, sync_playwright
@@ -21,6 +27,14 @@ _POST_URL = re.compile(r"https?://[^\"'\\s<>]+tistory\.com/\d+")
 
 class TistoryError(RuntimeError):
     pass
+
+
+class TistoryDailyLimit(TistoryError):
+    """하루 공개 발행 한도(15개)에 걸렸다. 내일 다시 올리면 된다."""
+
+
+def _is_daily_limit(text: str) -> bool:
+    return "최대" in text and "공개 발행" in text
 
 
 class TistoryPublisher:
@@ -36,6 +50,8 @@ class TistoryPublisher:
         self._post_url = ""
         self._tags_filled = False
         self._capture_post = False
+        self._alerts: list[str] = []
+        self._post_error = ""
 
     def __enter__(self) -> "TistoryPublisher":
         self._pw = sync_playwright().start()
@@ -180,8 +196,11 @@ class TistoryPublisher:
 
     # ------------------------------------------------------------------ 발행
 
-    def publish(self, title: str, link: str, tags: list[str]) -> str:
-        """제목과 네이버 글 링크, 태그로 글을 올리고 공개 주소(또는 관리 화면 주소)를 돌려준다."""
+    def publish(self, title: str, link: str, tags: list[str], *, article=None) -> str:
+        """글을 올리고 공개 주소(또는 관리 화면 주소)를 돌려준다.
+
+        article 을 주면 네이버와 같은 원고를, 없으면 네이버 글 링크만 넣는다.
+        """
         self.ensure_login()
         page = self.page
         write_url = f"{self.cfg.home}/manage/newpost/?type=post&returnURL=/manage/posts/"
@@ -201,12 +220,116 @@ class TistoryPublisher:
         page.get_by_role("textbox", name="제목을 입력하세요").fill(title)
 
         href = escape(link)
-        self._set_body(f'<p><a href="{href}" target="_blank" rel="noopener">{href}</a></p>')
+        body = ""
+        if article is not None:
+            html, images_ok = self._article_body(article)
+            body = html if images_ok or not link else ""
+        if not body:
+            if not link:
+                raise TistoryError("티스토리에 넣을 본문도 네이버 글 주소도 없습니다.")
+            body = f'<p><a href="{href}" target="_blank" rel="noopener">{href}</a></p>'
+        self._set_body(body)
         self._snap("filled")
 
         category_set = self._select_category(self.cfg.category) if self.cfg.category else True
         self._fill_tags(tags)
+        if self.cfg.wants_draft():
+            return self._save_draft()
         return self._finish(tags, category_set)
+
+    def _save_draft(self) -> str:
+        """글쓰기 화면 아래의 '임시저장' 을 누르고 저장 응답을 기다린다."""
+        page = self.page
+        button = page.locator("a.action:has-text('임시저장'), button:has-text('임시저장')").first
+        try:
+            with page.expect_response(
+                lambda r: "/manage/drafts" in r.url and r.request.method in ("POST", "PUT"),
+                timeout=30_000,
+            ) as saved:
+                button.click(timeout=8000)
+            response = saved.value
+        except (PlaywrightTimeout, PlaywrightError) as exc:
+            self._snap("no_draft")
+            raise TistoryError(f"티스토리 임시저장을 하지 못했습니다.\n  {exc}") from exc
+        if response.status != 200:
+            self._snap("draft_rejected")
+            raise TistoryError(f"티스토리가 임시저장을 거절했습니다. HTTP {response.status}")
+        page.wait_for_timeout(1000)
+        return f"{self.cfg.home}/manage/posts/  (글쓰기 화면의 '임시저장' 목록에서 확인·발행하세요)"
+
+    def _article_body(self, article) -> tuple[str, bool]:
+        """원고를 티스토리 HTML 로 바꾼다. 사진을 하나도 못 올렸으면 두 번째 값이 False 다."""
+        from render.html import render_tistory
+
+        uploaded: dict[Path, str] = {}
+        failed: list[str] = []
+
+        def image_url(asset) -> str:
+            path = asset.path
+            if not path or not Path(path).exists():
+                return ""
+            path = Path(path).resolve()
+            if path not in uploaded:
+                try:
+                    uploaded[path] = self._upload_image(path)
+                except TistoryError as exc:
+                    uploaded[path] = ""
+                    failed.append(f"{path.name}: {exc}")
+            if not uploaded[path]:
+                return ""
+            caption = "" if asset.source == "infographic" else (asset.credit or asset.caption)
+            return _image_replacer(uploaded[path], path, caption)
+
+        html = render_tistory(article, image_url)
+        if failed:
+            print(f"  [!] 티스토리 사진 {len(failed)}장을 올리지 못해 빼고 넣습니다.")
+            for line in failed[:3]:
+                print(f"      {line}")
+        if uploaded and not any(uploaded.values()):
+            print("  [!] 사진을 하나도 올리지 못했습니다. 네이버 글 링크가 있으면 링크만 올립니다.")
+            return html, False
+        return html, True
+
+    def _upload_image(self, path: Path) -> str:
+        """글쓰기 화면이 쓰는 첨부 주소로 올리고 kage@키/파일명 을 돌려준다.
+
+        응답의 url 은 달말에 만료되는 서명 주소라 본문에 쓰지 않는다.
+        """
+        mime = mimetypes.guess_type(path.name)[0] or "image/jpeg"
+        try:
+            result = self.page.evaluate(
+                """async ({url, b64, name, mime}) => {
+                    const bin = atob(b64);
+                    const bytes = new Uint8Array(bin.length);
+                    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+                    const form = new FormData();
+                    form.append('file', new Blob([bytes], { type: mime }), name);
+                    const headers = { Accept: 'application/json, text/plain, */*' };
+                    const xsrf = document.cookie.match(/(?:^|; )XSRF-TOKEN=([^;]*)/);
+                    if (xsrf) headers['X-XSRF-TOKEN'] = decodeURIComponent(xsrf[1]);
+                    const res = await fetch(url, { method: 'POST', body: form, credentials: 'include', headers });
+                    return { status: res.status, text: await res.text() };
+                }""",
+                {
+                    "url": f"{self.cfg.home}/manage/post/attach.json",
+                    "b64": base64.b64encode(path.read_bytes()).decode("ascii"),
+                    "name": path.name,
+                    "mime": mime,
+                },
+            )
+        except (PlaywrightError, OSError) as exc:
+            raise TistoryError(str(exc)) from exc
+        if result.get("status") != 200:
+            raise TistoryError(f"HTTP {result.get('status')}")
+        try:
+            data = json.loads(result.get("text") or "{}")
+        except ValueError as exc:
+            raise TistoryError("업로드 응답을 읽지 못했습니다.") from exc
+        key = str(data.get("key") or "").strip("/")
+        filename = str(data.get("filename") or "")
+        if not key or not filename or "|" in key + filename:
+            raise TistoryError("업로드 응답에 사진 키가 없습니다.")
+        return f"kage@{key}/{filename}"
 
     def _set_body(self, html: str) -> None:
         """HTML 모드의 코드 입력칸에 본문을 넣는다.
@@ -259,16 +382,20 @@ class TistoryPublisher:
             return
         self._switch_to_html_mode()
         try:
-            self.page.wait_for_selector(".CodeMirror.cm-s-tistory-html", state="attached", timeout=12_000)
+            self.page.wait_for_selector(".CodeMirror.cm-s-tistory-html", state="visible", timeout=12_000)
         except PlaywrightTimeout as exc:
             self._snap("no_html_editor")
             raise TistoryError("HTML 모드 입력칸이 열리지 않았습니다.") from exc
 
     def _html_editor_ready(self) -> bool:
+        # 기본모드에서도 숨은 HTML 입력칸이 미리 만들어져 있어, 보이는지까지 본다.
         try:
             return bool(
                 self.page.evaluate(
-                    "() => !!document.querySelector('.CodeMirror.cm-s-tistory-html')"
+                    """() => {
+                        const root = document.querySelector('.CodeMirror.cm-s-tistory-html');
+                        return !!(root && root.CodeMirror && root.offsetParent);
+                    }"""
                 )
             )
         except PlaywrightError:
@@ -424,9 +551,10 @@ class TistoryPublisher:
             )
             if not box.count():
                 box = page.get_by_role("textbox", name="태그")
-            if not box.count():
+            # 숨은 입력란이 같이 잡혀서, 보이는 것만 쓴다.
+            field = next((box.nth(i) for i in range(box.count()) if box.nth(i).is_visible()), None)
+            if field is None:
                 return
-            field = box.last
             for tag in clean[:20]:
                 field.click(timeout=5000)
                 field.fill(tag)
@@ -471,6 +599,7 @@ class TistoryPublisher:
 
         clicked = False
         self._capture_post = True
+        self._alerts.clear()
         for name in confirm_names:
             try:
                 page.get_by_role("button", name=name, exact=True).click(timeout=4000)
@@ -485,10 +614,7 @@ class TistoryPublisher:
                 f"  시도한 이름: {', '.join(confirm_names)}"
             )
 
-        try:
-            page.wait_for_url(re.compile(r"/manage/posts"), timeout=60_000)
-        except PlaywrightTimeout:
-            self._snap("after_publish")
+        self._wait_published()
 
         url = self._post_url or self._find_public_url()
         if public and url:
@@ -496,6 +622,49 @@ class TistoryPublisher:
         if public:
             return f"{self.cfg.home}/  (글 목록에서 방금 글을 확인하세요. 구글 반영은 며칠 걸릴 수 있습니다.)"
         return f"비공개로 저장했습니다. 구글에 노출하려면 TISTORY_VISIBILITY=3 으로 다시 올리세요. {url}".strip()
+
+    def _wait_published(self, timeout_s: float = 180) -> None:
+        """글 목록으로 넘어가거나 발행 응답이 올 때까지 기다린다.
+
+        글쓰기 주소에도 returnURL=/manage/posts/ 가 들어 있어 주소만 보면 바로 끝난 것처럼 보인다.
+        그대로 창을 닫으면 발행 요청이 끊겨 글이 올라가지 않는다.
+        """
+        page = self.page
+        started = time.monotonic()
+        deadline = started + timeout_s
+        hinted = False
+        while time.monotonic() < deadline:
+            if not hinted and time.monotonic() - started > 15:
+                hinted = True
+                print("  [!] 발행이 늦어지고 있습니다. 브라우저 창에 보안문자(캡차)나 안내가 떠 있으면 처리해 주세요.")
+            limit = next((m for m in self._alerts if _is_daily_limit(m)), "")
+            if limit or _is_daily_limit(self._post_error):
+                raise TistoryDailyLimit(
+                    f"{limit or '하루에 새롭게 공개 발행할 수 있는 글은 최대 15개까지입니다.'}\n"
+                    "티스토리 하루 한도입니다. 글은 올라가지 않았고, 내일 --tistory-only 로 올리면 됩니다."
+                )
+            failed = next((m for m in self._alerts if "실패" in m or "오류" in m), "")
+            if self._post_error and not failed:
+                failed = "발행 요청이 거절되었습니다."
+            if failed:
+                self._snap("publish_rejected")
+                page.wait_for_timeout(500)
+                detail = f"\n  서버 응답: {self._post_error}" if self._post_error else ""
+                raise TistoryError(f"티스토리가 발행을 거절했습니다.\n  {failed}{detail}")
+            if self._post_url:
+                return
+            try:
+                if urlparse(page.url).path.startswith("/manage/posts"):
+                    page.wait_for_timeout(1500)
+                    return
+            except PlaywrightError:
+                pass
+            page.wait_for_timeout(500)
+        self._snap("after_publish")
+        raise TistoryError(
+            f"발행 버튼을 누른 뒤 {int(timeout_s)}초 동안 완료되지 않았습니다.\n"
+            "티스토리 글 목록에서 글이 올라갔는지 확인한 뒤, 없으면 --tistory-only 로 다시 올리세요."
+        )
 
     def _find_public_url(self) -> str:
         if self._post_url:
@@ -513,6 +682,8 @@ class TistoryPublisher:
 
     def _on_dialog(self, dialog) -> None:
         message = dialog.message or ""
+        if dialog.type == "alert":
+            self._alerts.append(message.strip())
         try:
             if "이어서" in message:
                 dialog.dismiss()
@@ -529,6 +700,13 @@ class TistoryPublisher:
         try:
             body = response.text().replace("\\/", "/")
         except PlaywrightError:
+            return
+        if response.status != 200:
+            try:
+                reason = str(json.loads(body).get("message") or body)
+            except (ValueError, AttributeError):
+                reason = body
+            self._post_error = f"HTTP {response.status} {reason.strip()[:300]}"
             return
         match = _POST_URL.search(body)
         if match:
@@ -551,3 +729,18 @@ class TistoryPublisher:
 
 def _norm_category(name: str) -> str:
     return re.sub(r"\s+", " ", name.replace("\u00a0", " ")).strip()
+
+
+def _image_replacer(kage: str, path: Path, caption: str) -> str:
+    """티스토리 에디터가 본문에 남기는 사진 표기. 발행 때 첨부파일로 등록되고 만료되지 않는다."""
+    from PIL import Image
+
+    try:
+        with Image.open(path) as img:
+            width, height = img.size
+    except OSError:
+        width, height = 0, 0
+    meta = {"originWidth": width, "originHeight": height, "style": "alignCenter", "filename": path.name}
+    if caption:
+        meta["caption"] = escape(caption.strip(), quote=False).replace("|", "&#124;")
+    return f"[##_Image|{kage}|CDM|1.3|{json.dumps(meta, ensure_ascii=False)}_##]"
