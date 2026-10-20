@@ -156,6 +156,13 @@ class Pipeline:
 
         return self._generate(product, available, run_dir, stamp)
 
+    def collect(self, url: str, *, page_url: str = "") -> Product:
+        """글은 쓰지 않고 상품 페이지만 읽는다. 쇼츠 생성기가 쓴다."""
+        return self._collect_product(url, page_url or url, "", True)
+
+    def prepare_images(self, product: Product, run_dir: Path) -> list[ImageAsset]:
+        return self._prepare_images(product, run_dir)
+
     def resume(
         self,
         run_dir: Path,

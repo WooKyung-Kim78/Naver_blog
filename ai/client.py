@@ -41,6 +41,8 @@ class MyGenAssistClient:
         self.session.verify = cfg.verify_ssl
         #: 이 클라이언트로 보낸 AI 호출 수. 방식별 비용 비교에 쓴다.
         self.calls = 0
+        #: myGenAssist 가 응답마다 알려 주는 비용(cost)의 합. Gemini 는 알려 주지 않아 0 이다.
+        self.cost = 0.0
 
     def ping(self) -> dict:
         """선택한 제공자의 인증 및 API 접근 가능 여부를 확인한다."""
@@ -90,7 +92,11 @@ class MyGenAssistClient:
                 if resp.status_code >= 400:
                     provider = "Gemini" if self.cfg.provider == "gemini" else "API"
                     raise AIError(f"{provider} 오류 {resp.status_code}: {resp.text[:800]}")
-                return self._extract_text(resp.json())
+                data = resp.json()
+                cost = data.get("cost") if isinstance(data, dict) else None
+                if isinstance(cost, (int, float)):
+                    self.cost += cost
+                return self._extract_text(data)
             except (requests.RequestException, AIError) as exc:
                 last_error = exc
                 if attempt < retries:

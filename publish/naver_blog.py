@@ -47,6 +47,13 @@ IMAGE_BUTTON_SELECTORS = [
     "button[data-name='image']",
     ".se-toolbar-item-image button",
 ]
+#: 툴바 '동영상' -> 업로더 창(.se-popup-video-upload) -> '동영상 추가' 로 파일을 고른다 (2026-10 확인).
+VIDEO_BUTTON_SELECTORS = ["button.se-video-toolbar-button", "button[data-name='video']"]
+VIDEO_POPUP = ".se-popup-video-upload"
+VIDEO_LOCAL_BUTTON = "button.nvu_btn_append.nvu_local"
+VIDEO_COMPONENT = ".se-component.se-video"
+#: 업로드·인코딩을 기다리는 최대 시간(초)
+VIDEO_UPLOAD_TIMEOUT = 600
 DIVIDER_BUTTON_SELECTORS = [
     "button.se-horizontal-line-toolbar-button",
     "button[data-name='horizontalLine']",
@@ -126,9 +133,9 @@ def _same_label(text: str, wanted: str) -> bool:
 
 @dataclass
 class PostBlock:
-    kind: str  # text / image / quote / divider / product / link / notice
-    value: str = ""  # 텍스트 내용, 이미지 파일 경로, 또는 카드 실패 시 쓸 텍스트
-    query: str = ""  # product: 쇼핑 커넥트에서 상품을 찾을 검색어, link: 링크 주소
+    kind: str  # text / image / video / quote / divider / product / link / notice
+    value: str = ""  # 텍스트 내용, 이미지·동영상 파일 경로, 또는 카드 실패 시 쓸 텍스트
+    query: str = ""  # product: 쇼핑 커넥트에서 상품을 찾을 검색어, link: 링크 주소, video: 동영상 제목
 
 
 class NaverBlogPublisher:
@@ -382,6 +389,8 @@ class NaverBlogPublisher:
         for block in blocks:
             if block.kind == "image":
                 self._insert_image(page, frame, Path(block.value))
+            elif block.kind == "video":
+                self._insert_video(page, frame, Path(block.value), block.query)
             elif block.kind == "divider":
                 self._click_optional(frame, DIVIDER_BUTTON_SELECTORS)
             elif block.kind == "quote":
@@ -550,6 +559,62 @@ class NaverBlogPublisher:
             page.wait_for_timeout(4000)
         except (PlaywrightTimeout, NaverBlogError) as exc:
             print(f"  [!] 이미지 삽입 실패({path.name}): {exc}")
+
+    def _insert_video(self, page: Page, frame: FrameLocator, path: Path, title: str) -> None:
+        """툴바 '동영상' 로 올리고 본문에 동영상 캴포넌트가 생길 때까지 기다린다.
+
+        동영상 글에서 영상이 빠지면 의미가 없으므로, 못 넣으면 발행하지 않고 멈춘다.
+        """
+        if not path.exists():
+            raise NaverBlogError(f"동영상 파일이 없습니다: {path}")
+        popup = frame.locator(VIDEO_POPUP).first
+        before = frame.locator(VIDEO_COMPONENT).count()
+        try:
+            self._click_first(frame, VIDEO_BUTTON_SELECTORS, "동영상 버튼")
+            popup.wait_for(state="visible", timeout=10_000)
+            with page.expect_file_chooser(timeout=15_000) as chooser:
+                popup.locator(VIDEO_LOCAL_BUTTON).first.click()
+            chooser.value.set_files(str(path))
+            print(f"  동영상 업로드 중: {path.name}")
+            page.wait_for_timeout(3000)
+            self._snap("video_uploading")
+            if title:
+                self._fill_video_title(page, popup, title)
+
+            done = popup.locator("button").filter(has_text=re.compile(r"^\s*(완료|확인|등록|삽입)\s*$"))
+            deadline = time.monotonic() + VIDEO_UPLOAD_TIMEOUT
+            while time.monotonic() < deadline:
+                if frame.locator(VIDEO_COMPONENT).count() > before:
+                    break
+                try:
+                    button = done.last
+                    if button.is_visible(timeout=500) and button.is_enabled(timeout=500):
+                        button.click()
+                except (PlaywrightTimeout, PlaywrightError):
+                    pass
+                page.wait_for_timeout(2000)
+        except (PlaywrightTimeout, PlaywrightError) as exc:
+            self._snap("fail_video")
+            raise NaverBlogError(f"동영상을 올리지 못해 발행을 멈췄습니다: {exc}") from exc
+        if frame.locator(VIDEO_COMPONENT).count() <= before:
+            self._snap("fail_video")
+            raise NaverBlogError(
+                f"동영상이 {VIDEO_UPLOAD_TIMEOUT // 60}분 안에 본문에 들어가지 않아 발행을 멈췄습니다.\n"
+                "  --debug 로 다시 실행해 storage/screenshots 의 화면을 확인하세요."
+            )
+        print(f"  동영상 삽입: {path.name}")
+        page.wait_for_timeout(1500)
+
+    def _fill_video_title(self, page: Page, popup, title: str) -> None:
+        """업로더에 제목 칸이 보이면 채운다. 없으면 파일 이름이 제목이 된다."""
+        field = popup.locator("input[placeholder*='제목'], textarea[placeholder*='제목']").first
+        try:
+            field.wait_for(state="visible", timeout=20_000)
+            field.click()
+            page.keyboard.press("Control+A")
+            self._paste_text(page, title)
+        except (PlaywrightTimeout, PlaywrightError):
+            print("  [!] 동영상 제목 칸을 찾지 못해 파일 이름으로 둡니다.")
 
     def _insert_product_card(self, page: Page, frame: FrameLocator, query: str) -> bool:
         """툴바의 '쇼핑커넥트' 로 상품 카드를 넣는다. 못 넣으면 False.
