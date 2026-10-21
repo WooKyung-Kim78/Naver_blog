@@ -19,6 +19,7 @@
     python shorts/app.py URL --no-tts                          # 음성 없이 자막만
     python shorts/app.py URL --videos-dir 영상폴더             # 갖고 있는 상품 영상도 같이 쓰기
     python shorts/app.py URL --bgm music.mp3                   # 배경음악
+    python shorts/app.py URL --veo                             # 상품이 안 나오는 분위기 컷 1개를 Veo 로 추가 (--veo 2 면 2개)
     python shorts/app.py URL --upload                          # 만든 뒤 네이버(동영상 글)·티스토리에 올리기
     python shorts/app.py --each URL1 URL2 URL3 --upload        # 상품마다 쇼츠 하나씩 순서대로 (실패해도 다음 상품 계속)
     python shorts/app.py --upload-from shorts/output/폴더      # 이미 만든 쇼츠만 올리기
@@ -29,6 +30,7 @@
 대표 사진·소개글·네이버 동영상 글 링크·구매 버튼을 올린다. 발행/임시저장은 POST_MODE, TISTORY_POST_MODE 를 따른다.
 
 영상은 늘 20초다. 판매 페이지에서 내려받은 상품 영상과 사진만 쓰고, AI 로 상품 그림이나 영상을 만들지 않는다.
+--veo 를 주면 상품이 나오지 않는 분위기·사용 상황 컷만 myGenAssist video_generator(Veo)로 1~2개 만들어 섞는다.
 첫 장면 가운데에 큰 두 줄 훅(노랑/하양), 그 아래에 내레이션과 맞춘 테두리 자막, 오른쪽 위에 (광고) 표시가 들어간다.
 사진과 영상은 자르거나 늘리지 않고 통째로 보여 주며, 남는 곳은 같은 그림을 흐리게 깔아 채운다.
 상품 영상의 원래 소리는 끄고 내레이션만 넣는다.
@@ -36,6 +38,7 @@
 AI 는 블로그와 같은 .env 의 AI 설정으로 두 번 호출한다.
   1. 웹 검색으로 사람들이 실제로 치는 검색어(메인 키워드·함께 노릴 검색어·해시태그)를 조사한다.
   2. 사진과 영상(앞·중간·뒤 세 컷)을 보고 훅, 장면 순서와 대본, 유튜브 제목·설명·태그·고정 댓글을 쓴다.
+--veo 면 그 사이에 분위기 컷 구상 1번과 컷마다 Veo 생성 1번(6초 약 $0.6)을 더 호출한다.
 대본은 edge-tts(ko-KR-SunHiNeural)로 읽는다. 끝나면 이번 실행에 든 AI 비용을 보여 주고 meta.json 에 남긴다.
 업로드할 제목·설명(광고 표기·구매 링크·해시태그)·태그·고정 댓글은 결과 폴더의 youtube.txt 에 남는다.
 
@@ -49,6 +52,7 @@ AI 는 블로그와 같은 .env 의 AI 설정으로 두 번 호출한다.
     SHORTS_TTS_RATE=+15%
     SHORTS_TTS_PITCH=-4Hz
     SHORTS_BGM=배경음악.mp3
+    SHORTS_VEO_MODEL=veo-3.1-fast-generate-001
 """
 from __future__ import annotations
 
@@ -102,6 +106,9 @@ MAX_VIDEOS = 4
 SILENT_SCENE = 2.5
 SILENT_VIDEO = 5.0
 SCENE_PAD = 0.25
+VEO_MODEL = os.getenv("SHORTS_VEO_MODEL") or "veo-3.1-fast-generate-001"
+VEO_SECONDS = 6
+MAX_BROLL = 2
 # 사진은 처음 93% 크기에서 원래 크기로 천천히 다가간다. 잘리거나 늘어나는 곳은 없다
 PUSH = 0.93
 # 쇼츠 하단 약 450px 은 채널명·설명 UI 가 덮는다
@@ -166,14 +173,22 @@ def log(msg: str) -> None:
     print(msg, flush=True)
 
 
+# cp949 콘솔에서 이모지 하나 때문에 실행이 멈추지 않게 한다
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(errors="replace")
+
+
 @dataclass
 class Visual:
-    """화면에 쓸 재료. 사진은 1, 2, ... 영상은 V1, V2, ... 로 부른다."""
+    """화면에 쓸 재료. 사진은 1, 2, ... 영상은 V1, V2, ... Veo 분위기 컷은 B1, B2 ... 로 부른다."""
 
     label: str
     path: Path
     video: bool = False
     seconds: float = 0.0
+    ai: bool = False
+    note: str = ""
 
 
 @dataclass
@@ -566,12 +581,20 @@ def ai_plan(client, visuals: list[Visual], attach: list[Path], context: str, kw:
     main_keyword = str(kw.get("main_keyword") or "").strip()
     keywords = strs(kw.get("keywords"))
     photos = [v for v in visuals if not v.video]
-    videos = [v for v in visuals if v.video]
+    videos = [v for v in visuals if v.video and not v.ai]
+    broll = [v for v in visuals if v.ai]
     guide = [f"1~{len(photos)}번은 판매 페이지의 상품 사진이다. 1번이 대표 썸네일이다."]
     if videos:
         guide.append(f"그 뒤 {len(videos)}장은 판매 페이지에 있는 상품 영상의 장면을 3컷씩 이어 붙인 것이다.")
         guide += [f"  {len(photos) + k}번 그림 = 영상 {v.label} ({v.seconds:.0f}초)" for k, v in enumerate(videos, 1)]
     first_rule = "상품이 잘 보이는 영상이나 1번 사진으로 하고," if videos else "반드시 1번 사진으로 하고,"
+    if broll:
+        guide.append(f"마지막 {len(broll)}장은 AI 가 만든 분위기 영상의 장면이다. 상품은 나오지 않는다. 각각 한 번만, "
+                     "고민이나 쓰는 상황을 말하는 장면에만 쓰고 상품 외관·기능 설명에는 쓰지 않는다. "
+                     "글자나 글자 비슷한 모양이 보이는 B 영상은 깨져 보이므로 아예 쓰지 않는다.")
+        guide += [f"  {len(photos) + len(videos) + k}번 그림 = 영상 {v.label}: {v.note}"
+                  for k, v in enumerate(broll, 1)]
+        first_rule = "고민을 보여 주는 B 영상이나 " + first_rule.replace("반드시 ", "")
 
     log("AI 가 사진·영상을 보고 장면과 대본을 짜는 중...")
     try:
@@ -601,7 +624,7 @@ def ai_plan(client, visuals: list[Visual], attach: list[Path], context: str, kw:
             continue
         label = str(item.get("visual") or item.get("no") or "").strip().upper().lstrip("#")
         visual = by_label.get(label)
-        if visual is None or (not visual.video and label in used):
+        if visual is None or (label in used and not (visual.video and not visual.ai)):
             continue
         used.add(label)
         scenes.append(Scene(visual, clean_narration(str(item.get("narration") or ""))))
@@ -611,7 +634,7 @@ def ai_plan(client, visuals: list[Visual], attach: list[Path], context: str, kw:
         return None
 
     # 상품 영상이 없으면 첫 장면은 대표 썸네일로 고정하고, 대본 순서는 그대로 둔다
-    if not videos and photos:
+    if not videos and photos and not scenes[0].visual.ai:
         first = next((k for k, sc in enumerate(scenes) if sc.visual is photos[0]), None)
         if first:
             order = [sc.visual for sc in scenes]
@@ -645,14 +668,141 @@ def ai_plan(client, visuals: list[Visual], attach: list[Path], context: str, kw:
     return plan
 
 
+BROLL_USER = """아래 상품을 소개하는 쇼츠에 섞을 분위기 영상 {count}개를 AI 영상 생성기(Veo)로 만든다.
+
+{context}
+
+- 이 상품이 필요한 상황이나 시청자의 고민을 보여 주는 장면만 만든다.
+- 실제 상품과 다른 모습이 나오면 안 되므로 상품, 비슷한 기기·제품, 포장, 브랜드, 로고는 절대 나오지 않게 한다.
+- AI 가 그린 글자는 깨져 보이므로 글자·자막·간판·표지판·책·화면처럼 글자가 보일 만한 것도 넣지 않는다.
+  자막은 나중에 따로 얹는다.
+- 사람 얼굴은 크게 나오지 않게 한다. 손, 뒷모습, 실루엣은 괜찮다.
+- 장면 하나에 동작 하나. 세로 9:16 화면, 느린 카메라 움직임.
+- prompt: Veo 에 넣을 영어 설명 3~4문장. 위 금지 사항도 영어로 끝에 적는다.
+- purpose: 이 장면이 보여 주는 고민이나 상황을 한국어 한 줄로.
+
+아래 JSON 형식으로만 출력한다.
+{{"clips": [{{"prompt": "...", "purpose": "..."}}]}}"""
+
+VEO_SYSTEM = ("You generate one short vertical b-roll clip. Call the video generator tool exactly once "
+              "as a single-scene video, then reply with only the video URL.")
+
+VEO_USER = """model: {model}, video_type: single_scene, aspect_ratio: 9:16, resolution: 720p,
+duration_seconds: {seconds}, include_audio: false.
+Use this prompt as is:
+{prompt}
+Absolutely no products, devices, packaging, logos, brand names, or any visible text: no letters, subtitles,
+captions, signs, labels, books, screens, or watermarks."""
+
+VEO_URL = re.compile(r"https://[^\s()<>\[\]\"']+\.mp4[^\s()<>\[\]\"']*")
+
+
+def download_video(url: str, dest: Path, cfg) -> bool:
+    # 서명된 S3 주소라 API 키 헤더를 붙이지 않는다
+    try:
+        with requests.get(url, stream=True, timeout=120, proxies=cfg.proxies or None,
+                          verify=cfg.verify_ssl) as r:
+            if not r.ok or not r.headers.get("Content-Type", "").startswith("video/"):
+                log(f"[경고] 영상을 받지 못했습니다: HTTP {r.status_code} {r.headers.get('Content-Type')}")
+                return False
+            with open(dest, "wb") as f:
+                for chunk in r.iter_content(1 << 16):
+                    f.write(chunk)
+    except (requests.RequestException, OSError) as e:
+        log(f"[경고] 영상을 받지 못했습니다: {e}")
+        return False
+    return dest.stat().st_size > 0
+
+
+def make_broll(client, context: str, count: int, dest: Path) -> list[Visual]:
+    """상품이 나오지 않는 분위기·사용 상황 컷을 Veo 로 만든다. 실패한 컷은 빼고 진행한다."""
+    cfg = client.cfg
+    if cfg.provider != "mygenassist" or cfg.endpoint != "agent":
+        log("[경고] Veo 컷은 myGenAssist(AI_ENDPOINT=agent)에서만 만들 수 있어 건너뜁니다.")
+        return []
+    log(f"Veo 분위기 컷 {count}개 구상 중...")
+    try:
+        data = client.chat_json(AI_SYSTEM, BROLL_USER.format(count=count, context=context),
+                                temperature=0.7, max_tokens=3000, websearch=False)
+    except Exception as e:
+        log(f"[경고] 분위기 컷 구상 실패, 없이 만듭니다: {e}")
+        return []
+    clips = data.get("clips") if isinstance(data, dict) else None
+    clips = [c for c in clips or [] if isinstance(c, dict) and str(c.get("prompt") or "").strip()][:count]
+
+    dest.mkdir(parents=True, exist_ok=True)
+    out: list[Visual] = []
+    for clip in clips:
+        label = f"B{len(out) + 1}"
+        prompt = str(clip["prompt"]).strip()
+        purpose = str(clip.get("purpose") or "").strip()
+        log(f"  [{label}] Veo({VEO_MODEL})로 만드는 중, 2~3분 걸립니다: {purpose or prompt[:60]}")
+        try:
+            # 생성 도중 끊겨도 다시 보내면 비용이 또 들어 재시도하지 않는다
+            reply = client.chat(VEO_SYSTEM, VEO_USER.format(model=VEO_MODEL, seconds=VEO_SECONDS, prompt=prompt),
+                                temperature=0.2, max_tokens=2000, tool_keys=["video_generator"],
+                                retries=0, timeout=900)
+        except Exception as e:
+            log(f"[경고] {label} 생성 실패: {e}")
+            continue
+        m = VEO_URL.search(reply)
+        path = dest / f"{label}_veo.mp4"
+        if not m:
+            log(f"[경고] {label} 영상 주소가 응답에 없습니다: {reply[:200]}")
+            continue
+        if not download_video(m.group(0), path, cfg):
+            continue
+        seconds = video_seconds(path)
+        if seconds >= 1.5:
+            out.append(Visual(label, path, video=True, seconds=seconds, ai=True, note=purpose))
+    return out
+
+
 # ---------------------------------------------------------------- 글꼴·텍스트
 
 def find_font(user_font: str | None) -> str | None:
+    """한글을 그릴 수 있는 글꼴만 고른다. 없으면 None."""
     for path in [user_font, os.getenv("SHORTS_FONT")] + FONT_CANDIDATES.get(platform.system(), []):
-        if path and Path(path).is_file():
+        if not path or not Path(path).is_file():
+            continue
+        if all(has_glyph(path, ch) for ch in HANGUL_PROBE):
             return path
-    log("[경고] 한글 글꼴을 찾지 못했습니다. --font 또는 .env 의 SHORTS_FONT 로 지정하세요.")
+        log(f"[건너뜀] 한글이 없는 글꼴입니다: {path}")
+    log("[중단] 한글 글꼴을 찾지 못했습니다. --font 또는 .env 의 SHORTS_FONT 로 지정하세요.")
     return None
+
+
+HANGUL_PROBE = "가힌한글자막"
+_glyphs: dict[tuple[str, str], bool] = {}
+_probe_fonts: dict[str, ImageFont.FreeTypeFont] = {}
+
+
+def _draw_char(font: ImageFont.FreeTypeFont, ch: str) -> bytes:
+    img = Image.new("L", (64, 64))
+    ImageDraw.Draw(img).text((8, 8), ch, font=font, fill=255)
+    return img.tobytes()
+
+
+def has_glyph(font_path: str, ch: str) -> bool:
+    """글꼴에 없는 글자는 모두 같은 빈 상자(.notdef)로 그려진다."""
+    key = (font_path, ch)
+    if key not in _glyphs:
+        try:
+            if font_path not in _probe_fonts:
+                _probe_fonts[font_path] = ImageFont.truetype(font_path, 40)
+            font = _probe_fonts[font_path]
+            _glyphs[key] = ch.isspace() or _draw_char(font, ch) != _draw_char(font, "\uffff")
+        except OSError:
+            _glyphs[key] = False
+    return _glyphs[key]
+
+
+def screen_text(text: str, font_path: str | None) -> str:
+    """이모지처럼 글꼴에 없는 글자는 깨져 보이므로 빼고 그린다."""
+    if not font_path:
+        return text
+    kept = "".join(ch for ch in text if has_glyph(font_path, ch))
+    return re.sub(r"\s+", " ", kept).strip()
 
 
 def load_font(path: str | None, size: int) -> ImageFont.FreeTypeFont:
@@ -713,7 +863,9 @@ def draw_lines(lines: list[tuple[str, tuple]], font: ImageFont.FreeTypeFont, str
 
 def build_hook(lines: list[str], font_path: str | None) -> Image.Image:
     """첫 장면 가운데에 크게 띄우는 두 줄. 첫 줄은 노랑, 둘째 줄은 하양."""
-    lines = [line for line in lines if line][:2]
+    lines = [s for s in (screen_text(line, font_path) for line in lines) if s][:2]
+    if not lines:
+        return Image.new("RGBA", (1, 1), (0, 0, 0, 0))
     size = HOOK_SIZE
     while size > 64:
         font = load_font(font_path, size)
@@ -726,6 +878,9 @@ def build_hook(lines: list[str], font_path: str | None) -> Image.Image:
 
 
 def build_sub(text: str, font_path: str | None) -> Image.Image:
+    text = screen_text(text, font_path)
+    if not text:
+        return Image.new("RGBA", (1, 1), (0, 0, 0, 0))
     font, lines = fit_text(text, font_path, W - 140, 2, range(SUB_SIZE, 47, -4))
     return draw_lines([(line, WHITE) for line in lines], font, stroke=7)
 
@@ -1354,6 +1509,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--no-ai", action="store_true", help="AI 사진 선별·제목·대본 없이 만든다")
     ap.add_argument("--no-tts", action="store_true", help="음성 없이 자막만 넣는다")
     ap.add_argument("--bgm", type=Path, default=os.getenv("SHORTS_BGM") or None, help="배경음악 파일")
+    ap.add_argument("--veo", type=int, nargs="?", const=1, default=0, choices=range(1, MAX_BROLL + 1), metavar="N",
+                    help=f"상품이 나오지 않는 분위기 컷 N개(기본 1, 최대 {MAX_BROLL})를 Veo 로 만들어 섞는다. 컷당 약 $0.6")
     ap.add_argument("--upload", action="store_true", help="만든 뒤 네이버 블로그(동영상 글)와 티스토리에 올린다")
     ap.add_argument("--upload-from", type=Path, help="이미 만든 결과 폴더를 올린다 (영상은 다시 만들지 않는다)")
     ap.add_argument("--no-tistory", action="store_true", help="올릴 때 티스토리는 건너뛴다")
@@ -1423,6 +1580,10 @@ class Made:
 
 def make_shorts(args, url: str | None, page_url: str) -> Made | str:
     """쇼츠 하나를 만든다. 실패하면 그 이유를 문자열로 돌려준다."""
+    # 자막이 깨지지 않게, AI 비용을 쓰기 전에 한글 글꼴부터 확인한다
+    font_path = find_font(args.font)
+    if not font_path:
+        return "한글 글꼴을 찾지 못했습니다"
     use_ai = not args.no_ai
     budget = read_budget()
 
@@ -1476,12 +1637,18 @@ def make_shorts(args, url: str | None, page_url: str) -> Made | str:
 
     plan = None
     kw: dict = {}
+    broll: list[Visual] = []
     client = make_client() if use_ai else None
     if client:
         kw = ai_keywords(client, context)
+        if args.veo:
+            broll = make_broll(client, context, args.veo, out_dir / "videos")
         attach = [p.path for p in photos]
-        attach += [s for v in videos if (s := contact_sheet(v.path, v.seconds, out_dir / "videos" / f"{v.label}_sheet.jpg"))]
-        plan = ai_plan(client, photos + videos, attach, context, kw)
+        attach += [s for v in videos + broll
+                   if (s := contact_sheet(v.path, v.seconds, out_dir / "videos" / f"{v.label}_sheet.jpg"))]
+        plan = ai_plan(client, photos + videos + broll, attach, context, kw)
+    elif args.veo:
+        log("[안내] Veo 분위기 컷은 AI 대본과 함께만 만들어 이번에는 건너뜁니다.")
     if plan is None:
         order = photos[:1] + videos + photos[1:]
         plan = Plan(scenes=[Scene(v) for v in order[:MAX_SCENES]],
@@ -1496,7 +1663,6 @@ def make_shorts(args, url: str | None, page_url: str) -> Made | str:
     cta = CTA_NARRATION if ali else LINK_CTA
     scenes.append(Scene(photos[0] if photos else videos[0], cta))
 
-    font_path = find_font(args.font)
     video = out_dir / "shorts.mp4"
     log("음성 만드는 중..." if not args.no_tts else "음성 없이 자막만 넣습니다.")
     try:
@@ -1530,6 +1696,8 @@ def make_shorts(args, url: str | None, page_url: str) -> Made | str:
         "youtube": youtube,
         "blog": blog,
         "videos": [{"label": v.label, "file": str(v.path), "seconds": round(v.seconds, 2)} for v in videos],
+        "broll": [{"label": v.label, "file": str(v.path), "seconds": round(v.seconds, 2), "purpose": v.note,
+                   "model": VEO_MODEL} for v in broll],
         "voice": None if args.no_tts else f"{TTS_VOICE} rate={TTS_RATE} pitch={TTS_PITCH}",
         "image_urls": shop.image_urls if shop is not None else product.image_urls,
         "scenes": [{"visual": sc.visual.label, "file": str(sc.visual.path), "narration": sc.narration,

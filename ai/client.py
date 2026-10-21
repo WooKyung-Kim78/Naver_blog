@@ -72,6 +72,8 @@ class MyGenAssistClient:
         websearch: bool | None = None,
         images: list[Path] | None = None,
         retries: int = 2,
+        tool_keys: list[str] | None = None,
+        timeout: int = 300,
     ) -> str:
         if self.cfg.provider == "gemini":
             payload = self._gemini_payload(
@@ -79,7 +81,7 @@ class MyGenAssistClient:
             )
         else:
             payload = (
-                self._agent_payload(system, user, temperature, max_tokens, json_mode, websearch, images)
+                self._agent_payload(system, user, temperature, max_tokens, json_mode, websearch, images, tool_keys)
                 if self.cfg.endpoint == "agent"
                 else self._responses_payload(system, user, temperature, max_tokens, json_mode)
             )
@@ -88,7 +90,7 @@ class MyGenAssistClient:
         self.calls += 1
         for attempt in range(retries + 1):
             try:
-                resp = self.session.post(self.cfg.url, json=payload, timeout=300)
+                resp = self.session.post(self.cfg.url, json=payload, timeout=timeout)
                 if resp.status_code >= 400:
                     provider = "Gemini" if self.cfg.provider == "gemini" else "API"
                     raise AIError(f"{provider} 오류 {resp.status_code}: {resp.text[:800]}")
@@ -107,7 +109,8 @@ class MyGenAssistClient:
         raw = self.chat(system, user, json_mode=self.cfg.supports_json_mode, **kwargs)
         return _parse_json(raw)
 
-    def _agent_payload(self, system, user, temperature, max_tokens, json_mode, websearch, images=None) -> dict:
+    def _agent_payload(self, system, user, temperature, max_tokens, json_mode, websearch, images=None,
+                       tool_keys=None) -> dict:
         content: str | list = user
         if images:
             content = [{"type": "text", "text": user}]
@@ -128,7 +131,9 @@ class MyGenAssistClient:
             "stream": False,
         }
         use_search = self.cfg.use_websearch if websearch is None else websearch
-        if use_search:
+        if tool_keys:
+            payload["agent"] = {"type": "react", "tool_keys": tool_keys}
+        elif use_search:
             payload["agent"] = {"type": "react", "tool_keys": ["websearch"]}
         if json_mode:
             payload["response_format"] = {"type": "json_object"}
