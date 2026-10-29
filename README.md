@@ -37,6 +37,30 @@
    └─ publish/tistory.py       네이버와 같은 원고(글·사진·구매 버튼)를 티스토리에 발행
 ```
 
+## 뉴스 요약과 연관 상품 추천
+
+분야별 최신 뉴스 10건을 게시 시각순으로 가져오고, 기사 제목·요약에서 규칙 기반 키워드와
+이슈를 추출해 네이버 쇼핑 검색 결과 중 관련 상품 TOP 3을 보여 준다. 기사 원문에 근거하는
+발췌형 요약이며 AI가 새 사실을 생성하지 않는다.
+
+키는 두 종류다. NAVER API HUB 에는 쇼핑 상품 검색이 없어서 쇼핑은 NAVER Developers 키를 따로 쓴다.
+
+| 용도 | 발급처 | `.env` 키 | 호출 주소 |
+| --- | --- | --- | --- |
+| 뉴스 (필수) | [NAVER API HUB](https://console.ncloud.com/naver-api-hub/subscription) | `NAVER_CLIENT_ID`, `NAVER_CLIENT_SECRET` | `naverapihub.apigw.ntruss.com/search/v1/news` |
+| 쇼핑 (선택) | [NAVER Developers](https://developers.naver.com/apps) 검색 API | `NAVER_SHOP_CLIENT_ID`, `NAVER_SHOP_CLIENT_SECRET` | `openapi.naver.com/v1/search/shop.json` |
+
+쇼핑 키가 없거나 쇼핑 호출이 실패해도 뉴스 요약은 그대로 나오고, 이유만 안내한다.
+
+```shell
+python main.py news --category "IT"
+```
+
+파이썬에서 `news_blog.fetch_news_digest("패션")`을 호출하면 뉴스, 키워드, 이슈, 상품 추천을
+`NewsDigest`로 받는다. 상품별 구매 주소는 `purchase_url`에, 추천을 못 가져온 이유는
+`recommendation_note`에 담긴다. 이 기능은 기존 `core/shopping_connect.py`의 제휴 카드
+생성과는 별개다.
+
 ## 집중 포인트 선택
 
 장점을 골고루 나열한 글은 아무것도 각인되지 않는다. 그래서 집필 전에 한 번 멈춘다.

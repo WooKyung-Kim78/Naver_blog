@@ -176,6 +176,35 @@ class NaverConfig:
 
 
 @dataclass
+class NaverSearchConfig:
+    """네이버 검색 API 설정.
+
+    뉴스는 NAVER API HUB(네이버 클라우드) 키로, 쇼핑 상품 검색은 API HUB 에
+    없어서 NAVER Developers 키로 따로 호출한다. 쇼핑 키는 없어도 된다.
+    """
+
+    client_id: str
+    client_secret: str
+    shop_client_id: str = ""
+    shop_client_secret: str = ""
+
+    @property
+    def has_shop_keys(self) -> bool:
+        return bool(self.shop_client_id and self.shop_client_secret)
+
+    def validate(self) -> None:
+        missing = [
+            name for name, value in (
+                ("NAVER_CLIENT_ID", self.client_id),
+                ("NAVER_CLIENT_SECRET", self.client_secret),
+            )
+            if not value
+        ]
+        if missing:
+            raise ConfigError(f"{', '.join(missing)} 값이 비어 있습니다. .env 를 확인하세요.")
+
+
+@dataclass
 class TistoryConfig:
     """티스토리 발행. 공식 Open API 는 종료되어 브라우저 세션으로 올린다."""
 
@@ -315,6 +344,15 @@ def load_naver_config() -> NaverConfig:
         subject=_get("NAVER_SUBJECT", "상품리뷰"),
         post_mode=_get("POST_MODE", "publish").lower(),
         headed=_get_bool("BROWSER_HEADED", True),
+    )
+
+
+def load_naver_search_config() -> NaverSearchConfig:
+    return NaverSearchConfig(
+        client_id=_get("NAVER_CLIENT_ID"),
+        client_secret=_get("NAVER_CLIENT_SECRET"),
+        shop_client_id=_get("NAVER_SHOP_CLIENT_ID"),
+        shop_client_secret=_get("NAVER_SHOP_CLIENT_SECRET"),
     )
 
 

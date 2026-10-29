@@ -2,6 +2,7 @@
 
 사용법:
     python main.py doctor                      설정과 API 연결 상태 점검
+    python main.py news --category IT          최신 뉴스 요약과 연관 상품 추천
     python main.py post --url <상품 URL>        생성 후 네이버와 티스토리에 업로드
     python main.py post --url <URL> --dry-run   업로드 없이 원고와 이미지만 생성
     python main.py upload                      이미 만든 결과물을 네이버·티스토리에 올리기
@@ -50,6 +51,9 @@ def main() -> int:
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("doctor", help="설정과 API 연결 점검")
+
+    news = sub.add_parser("news", help="최신 분야 뉴스 요약과 연관 쇼핑 상품 검색")
+    news.add_argument("--category", required=True, help="뉴스 검색 분야 (예: IT, 패션, 라이프스타일)")
 
     post = sub.add_parser("post", help="상품 URL 로 리뷰 생성")
     post.add_argument(
@@ -114,6 +118,8 @@ def main() -> int:
     try:
         if args.command == "doctor":
             return cmd_doctor()
+        if args.command == "news":
+            return cmd_news(args.category)
         if args.command == "tistory-login":
             return cmd_tistory_login()
         if args.command == "upload":
@@ -247,6 +253,28 @@ def cmd_doctor() -> int:
         table.add_row("Playwright", f"[red]실패[/red] {str(exc)[:100]} → playwright install chromium")
 
     console.print(table)
+    return 0
+
+
+def cmd_news(category: str) -> int:
+    from news_blog import fetch_news_digest
+
+    digest = fetch_news_digest(category)
+    console.print(Panel(escape(digest.summary), title=f"{escape(digest.category)} 뉴스 요약", title_align="left"))
+    news_table = Table("#", "제목", "게시 시각", "원문")
+    for index, article in enumerate(digest.articles, 1):
+        news_table.add_row(str(index), escape(article.title), article.published_at, article.source_url)
+    console.print(news_table)
+
+    if digest.recommendations:
+        product_table = Table("#", "추천 상품", "가격", "판매처", "구매 링크")
+        for index, product in enumerate(digest.recommendations, 1):
+            product_table.add_row(
+                str(index), escape(product.title), product.price, escape(product.mall_name), product.purchase_url
+            )
+        console.print(product_table)
+    if digest.recommendation_note:
+        console.print(f"[yellow]추천 상품:[/yellow] {escape(digest.recommendation_note)}")
     return 0
 
 
